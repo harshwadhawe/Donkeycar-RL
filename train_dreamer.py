@@ -95,14 +95,23 @@ class DonkeyPreprocessWrapper(gym.ObservationWrapper):
 # Reward Shaping Wrapper
 # ==============================================================================
 class RewardShapingWrapper(gym.Wrapper):
-    """CTE bell curve + speed reward + survival + crash penalty."""
+    """
+    Reward shaping for Dreamer: wider CTE bell, moderate penalties.
 
-    def __init__(self, env):
+    Key design: rewards should be dense, informative, and NOT dominated
+    by a single penalty. The agent needs gradient signal for "slightly
+    better" trajectories, not just "everything is equally bad."
+    """
+
+    def __init__(self, env, max_episode_steps=None):
         super().__init__(env)
         self.episode_step = 0
+        self.max_episode_steps = max_episode_steps or cfg.DREAMER_MAX_EPISODE_STEPS
+        self.last_steering = 0.0
 
     def reset(self, **kwargs):
         self.episode_step = 0
+        self.last_steering = 0.0
         return self.env.reset(**kwargs)
 
     def step(self, action):
@@ -112,24 +121,35 @@ class RewardShapingWrapper(gym.Wrapper):
         speed = float(info.get("speed", 0.0))
         cte = float(info.get("cte", 0.0))
 
-        # CTE bell curve (centered on track)
-        cte_reward = 5.0 * np.exp(-(cte / 0.35) ** 2)
+        # CTE bell curve — WIDER sigma (1.0) so agent gets gradient
+        # even when moderately off-center. sigma=0.35 was too tight.
+        cte_reward = 3.0 * np.exp(-(cte / 1.0) ** 2)
 
-        # Speed reward
-        speed_reward = max(speed, 0.0) ** 1.15
+        # Speed reward — only forward progress matters
+        speed_reward = 0.5 * max(speed, 0.0)
 
-        # Survival bonus (ramps up during episode)
-        surv = 0.03 + 0.22 * min(self.episode_step / 10_000, 1.0)
+        # Survival bonus (constant, not ramped — we want immediate signal)
+        survival = 0.1
 
-        reward = speed_reward + cte_reward + surv
+        reward = cte_reward + speed_reward + survival
 
-        # Standstill penalty
-        if speed < 0.25:
-            reward -= 1.0
+        # Steering smoothness penalty — punish back-and-forth oscillation
+        steering = float(np.asarray(action)[0]) if hasattr(action, '__len__') else 0.0
+        steer_diff = abs(steering - self.last_steering)
+        reward -= 0.3 * steer_diff ** 2
+        self.last_steering = steering
 
-        # Crash penalty
+        # Standstill penalty (mild)
+        if speed < 0.1:
+            reward -= 0.5
+
+        # Crash penalty — moderate (10, not 120!)
         if terminated or truncated:
-            reward -= 120.0
+            reward -= 10.0
+
+        # Episode step limit
+        if self.episode_step >= self.max_episode_steps:
+            truncated = True
 
         return obs, reward, terminated, truncated, info
 
@@ -201,6 +221,8 @@ def train(args):
         ),
         "log_level": 20,
         "throttle_max": 1.0,
+        "max_cte": 3.0,        # terminate early when hopelessly off-track
+        "start_delay": 2.0,    # faster episode starts
     }
 
     logger.info(f'Track: {track}')
@@ -261,7 +283,11 @@ def train(args):
 
                 explore = episode < cfg.DREAMER_SEED_EPISODES
                 if explore:
-                    action = np.random.uniform(-1, 1, size=2).astype(np.float32)
+                    # Forward-biased exploration: small random steering,
+                    # fixed throttle. Pure uniform [-1,1] creates garbage data.
+                    steer = np.random.uniform(-0.5, 0.5)
+                    throttle = cfg.DREAMER_THROTTLE_BASE + np.random.uniform(-0.1, 0.1)
+                    action = np.array([steer, throttle], dtype=np.float32)
                 else:
                     action = dreamer.select_action(
                         obs_tensor, action_tensor, explore=True
@@ -281,9 +307,10 @@ def train(args):
                 last_action = action
 
             dt = time.time() - t0
+            avg_reward = episode_reward / max(episode_steps, 1)
             logger.info(
                 f'Episode {episode}: steps={episode_steps}, '
-                f'reward={episode_reward:.1f}, '
+                f'reward={episode_reward:.1f} (avg={avg_reward:.2f}/step), '
                 f'buffer={buffer.total_steps}, time={dt:.1f}s'
             )
 

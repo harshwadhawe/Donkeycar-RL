@@ -330,6 +330,8 @@ def main():
         ),
         "log_level": 20,
         "throttle_max": 1.0,
+        "max_cte": 3.0,
+        "start_delay": 2.0,
     }
 
     print(f'Track: {track}')

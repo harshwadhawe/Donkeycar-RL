@@ -70,7 +70,7 @@ python drive_rl.py --type=sac --model=models/sac.pth    # inference with trained
 python drive_rl.py --type=dreamer --model=models/dr.pth # inference with trained Dreamer
 
 # SB3 SAC + VAE training (standalone, no vehicle loop)
-python -m vae.train_vae --tub=data/tub_sim --epochs=100 # Step 1: train VAE (once)
+python -m vae.train_vae --tub=data/tub_sim --epochs=150 --batch-size=256 --kl-weight=0.1  # Step 1: train VAE (once)
 python train_sac.py                                     # Step 2: train SAC (launches sim)
 python train_sac.py --resume                            # auto-resume from checkpoint
 python train_sac.py --timesteps=500000                  # custom timestep count
@@ -79,15 +79,28 @@ python train_sac.py --timesteps=500000                  # custom timestep count
 python train_dreamer.py                                  # train from scratch
 python train_dreamer.py --resume                         # resume training
 python train_dreamer.py --episodes=200                   # custom episode count
+```
 
-# Linux: run training in background (survives terminal close)
+### Linux CUDA Training (4060, background with nohup)
+
+```bash
 export DISPLAY=:0
-nohup python -u train_sac.py > logs/train_sac.log 2>&1 &
-nohup python -u train_dreamer.py > logs/train_dreamer.log 2>&1 &
-tail -f logs/train_sac.log                               # follow progress
+export PYTHONUNBUFFERED=1
 
-# Monitor training
-tensorboard --logdir ./logs/tb_logs/ --port 6006
+# Step 1: Train VAE
+nohup python -u -m vae.train_vae --tub=data/tub_sim --epochs=150 --batch-size=256 --kl-weight=0.1 > logs/train_vae.log 2>&1 &
+tail -f logs/train_vae.log
+
+# Step 2: Train SAC (after VAE finishes)
+nohup python -u train_sac.py > logs/train_sac.log 2>&1 &
+tail -f logs/train_sac.log
+
+# Step 3: Train Dreamer (can run on separate port if needed)
+nohup python -u train_dreamer.py --episodes=200 > logs/train_dreamer.log 2>&1 &
+tail -f logs/train_dreamer.log
+
+# Monitor with TensorBoard
+nohup tensorboard --logdir ./logs/tb_logs/ --port 6006 --bind_all > logs/tensorboard.log 2>&1 &
 ```
 
 ## Architecture

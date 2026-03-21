@@ -331,9 +331,11 @@ class ActorModel(nn.Module):
 
     def sample_action(self, features, explore=False, expl_amount=0.3):
         dist = self.get_dist(features)
-        action = dist.rsample() if explore else dist.mean
-        if explore and expl_amount > 0:
-            action = action + expl_amount * torch.randn_like(action)
+        if explore:
+            # rsample already adds noise via the distribution std
+            action = dist.rsample()
+        else:
+            action = dist.mean
         action = torch.tanh(action)
 
         if self.fix_speed:
@@ -570,10 +572,13 @@ class Dreamer:
             for p in self.value_model.parameters():
                 p.requires_grad_(False)
 
-            imag_belief = beliefs[-1].detach()
-            imag_state = posterior_states[-1].detach()
-            imag_beliefs = [imag_belief]
-            imag_states = [imag_state]
+            # Imagine from ALL timesteps (not just the last)
+            # Flatten (T, B) -> (T*B,) as starting states
+            flat_belief = beliefs.detach().reshape(-1, bs)       # (T*B, bs)
+            flat_state = posterior_states.detach().reshape(-1, ss)  # (T*B, ss)
+
+            imag_beliefs = [flat_belief]
+            imag_states = [flat_state]
 
             for _ in range(cfg.DREAMER_PLANNING_HORIZON):
                 imag_features = torch.cat(
@@ -586,8 +591,8 @@ class Dreamer:
                 imag_beliefs.append(new_belief)
                 imag_states.append(new_state)
 
-            imag_beliefs = torch.stack(imag_beliefs)     # (H+1, B, bs)
-            imag_states = torch.stack(imag_states)       # (H+1, B, ss)
+            imag_beliefs = torch.stack(imag_beliefs)     # (H+1, T*B, bs)
+            imag_states = torch.stack(imag_states)       # (H+1, T*B, ss)
             imag_features = torch.cat([imag_beliefs, imag_states], dim=-1)
 
             # Predict rewards, values, continues in imagination

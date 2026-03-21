@@ -56,7 +56,7 @@ VAE_L2_REG = True
 # ─── Dreamer v3 ──────────────────────────────────────────
 # Based on: Mastering Diverse Domains through World Models (arXiv:2301.04104)
 
-DREAMER_SEED_EPISODES = 5       # random episodes to seed the buffer
+DREAMER_SEED_EPISODES = 10      # random episodes to seed the buffer
 DREAMER_GRADIENT_STEPS = 100    # world model updates per data collection
 
 # RSSM — categorical latent state
@@ -70,8 +70,8 @@ DREAMER_UNIMIX = 0.01           # uniform noise mixed into categoricals
 
 # World model training
 DREAMER_WORLD_LR = 1e-4
-DREAMER_ACTOR_LR = 3e-5
-DREAMER_VALUE_LR = 3e-5
+DREAMER_ACTOR_LR = 8e-5
+DREAMER_VALUE_LR = 8e-5
 DREAMER_ADAM_EPS = 1e-8
 DREAMER_BATCH_SIZE = 16
 DREAMER_CHUNK_SIZE = 50         # sequence length for BPTT
@@ -93,10 +93,10 @@ DREAMER_RETURN_NORM_LOW = 5     # lower percentile
 DREAMER_RETURN_NORM_HIGH = 95   # upper percentile
 
 # Actor
-DREAMER_ACTOR_ENTROPY = 3e-4   # entropy regularization coefficient
+DREAMER_ACTOR_ENTROPY = 1e-3   # entropy regularization coefficient
 DREAMER_ACTOR_MIN_STD = 0.1    # minimum action std
-DREAMER_ACTOR_INIT_STD = 1.0   # initial action std (before training)
-DREAMER_EXPL_AMOUNT = 0.3      # exploration noise std
+DREAMER_ACTOR_INIT_STD = 0.5   # initial action std (before training)
+DREAMER_EXPL_AMOUNT = 0.15     # exploration noise std
 
 # Slow critic (EMA target, replaces hard target updates)
 DREAMER_SLOW_TARGET_FRACTION = 0.02  # EMA rate per gradient step
@@ -105,5 +105,8 @@ DREAMER_SLOW_TARGET_FRACTION = 0.02  # EMA rate per gradient step
 DREAMER_BUFFER_SIZE = 1_000_000
 
 # Throttle control
-DREAMER_FIX_SPEED = False       # if True, only learn steering
-DREAMER_THROTTLE_BASE = 0.3    # base throttle for affine transform
+DREAMER_FIX_SPEED = True        # fix throttle so agent only learns steering first
+DREAMER_THROTTLE_BASE = 0.35   # fixed throttle value (moderate speed)
+
+# Episode limits
+DREAMER_MAX_EPISODE_STEPS = 1000  # truncate episodes to prevent aimless wandering
