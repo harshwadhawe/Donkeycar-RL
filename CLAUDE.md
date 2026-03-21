@@ -11,6 +11,15 @@ This is a **Donkey Car** autonomous RC car application — a Python-based self-d
 Always activate the conda environment before running any commands:
 ```bash
 conda activate donkey
+pip install -r requirements.txt   # one-time: installs SB3, gymnasium, etc.
+```
+
+**PyTorch** must be installed separately for the correct backend:
+```bash
+# macOS (MPS):
+pip install torch torchvision
+# Linux CUDA (e.g. RTX 4060):
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 ```
 
 ## Common Commands
@@ -30,6 +39,24 @@ python calibrate.py
 
 # Drive with joystick
 python manage.py drive --js
+
+# RL driving via donkeycar vehicle loop
+python drive_rl.py --type=sac --train                   # SAC+VAE: train from scratch
+python drive_rl.py --type=dreamer --train               # Dreamer v3: train from scratch
+python drive_rl.py --type=sac --model=models/sac.pth    # inference with trained SAC
+python drive_rl.py --type=dreamer --model=models/dr.pth # inference with trained Dreamer
+
+# SB3 SAC + VAE training (standalone, no vehicle loop)
+python -m vae.train_vae --tub=data/tub_sim --epochs=100 # Step 1: train VAE (once)
+python train_sac.py                                     # Step 2: train SAC (launches sim)
+python train_sac.py --resume                            # auto-resume from checkpoint
+python train_sac.py --timesteps=500000                  # custom timestep count
+
+# Dreamer v3 training (standalone, no vehicle loop)
+python train_dreamer.py                                  # train from scratch
+python train_dreamer.py --resume                         # resume training
+python train_dreamer.py --episodes=200                   # custom episode count
+tensorboard --logdir ./logs/tb_logs/ --port 6006        # monitor training
 ```
 
 ## Architecture
@@ -88,3 +115,23 @@ Set `DONKEY_GYM = True` in config to use the Donkey Gym simulator instead of phy
 ### Hardware Abstraction
 
 GPIO pin access is abstracted as `RPI_GPIO`, `PIGPIO`, or `PCA9685` — configured in `config.py`. The framework targets Raspberry Pi but supports Nano and custom boards.
+
+### RL Module (`rl/`)
+
+Reinforcement learning. Two algorithms: SAC+VAE (model-free) and Dreamer v3 (model-based, arXiv:2301.04104).
+
+- **`rl/config.py`** — All hyperparameters for both algorithms
+- **`rl/vae.py`** — VAE encoder/decoder (40x40 grayscale → 20D latent). Used by SAC only.
+- **`rl/dreamer.py`** — Dreamer v3: categorical RSSM (256D belief + 16x16 categorical state), symlog predictions, KL balancing, LayerNorm+SiLU, percentile return normalization, slow EMA critic
+- **`rl/sac.py`** — SAC+VAE: Gaussian actor (35→64→64→2), twin critics, auto-entropy tuning
+- **`rl/buffer.py`** — `ReplayBuffer` (flat, for SAC) and `EpisodeBuffer` (sequential chunks, for Dreamer)
+- **`rl/agent.py`** — `SACPilot` and `DreamerPilot` donkeycar parts with episode management, death detection, training
+- **`drive_rl.py`** — Vehicle loop entry point: `--type=sac|dreamer`, `--train`, `--model=<path>`
+
+### Standalone RL Training (`train_sac.py`, `train_dreamer.py`)
+
+Bypass the donkeycar vehicle loop — train directly against the gym simulator. Includes reward shaping (CTE bell curve, speed, survival, HOF), action smoothing, checkpointing, and TensorBoard logging.
+
+- **`vae/`** — VAE module for SAC observation encoding (32D latent from 120x160 images)
+- **`train_sac.py`** — SB3 SAC + pre-trained VAE, frame stacking, auto-resume
+- **`train_dreamer.py`** — Dreamer v3 standalone training with image preprocessing

@@ -1,0 +1,27 @@
+# Core ML (install PyTorch FIRST — see below)
+# ─────────────────────────────────────────────
+# CUDA (Linux/4060):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# MPS (macOS Apple Silicon):
+#   pip install torch torchvision
+# CPU only:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+
+# Donkey Car framework
+donkeycar>=5.0
+
+# RL training (SB3 SAC + VAE pipeline)
+stable-baselines3>=2.1
+tensorboard>=2.14
+
+# Gymnasium (donkey car gym env)
+gymnasium>=1.0
+gym_donkeycar>=1.3
+
+# Image processing
+opencv-python-headless>=4.8
+pillow>=10.0
+numpy>=1.24,<2.0
+
+# CLI
+docopt>=0.6
