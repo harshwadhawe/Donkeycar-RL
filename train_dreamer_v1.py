@@ -129,33 +129,27 @@ class CTEEstimator:
 # Reward Shaping — v4: uses only working telemetry
 # ==============================================================================
 def compute_reward(info, speed, cte, terminated, last_steering, steering):
-    """Reward driving, penalize circling.
+    """Reward forward driving, penalize circling.
 
-    BROKEN sim fields: forward_vel=0, pos=(0,0,0), vel=(0,0,0)
-    WORKING sim fields: speed, car (yaw), gyro (yaw rate)
-
-    Anti-circling: penalize high steering magnitude + high yaw rate from gyro.
+    Requires extendedTelemetry enabled in sim UI.
+    Uses forward_vel (real value) instead of speed magnitude.
     """
-    # Speed reward (only magnitude available, yaw penalties handle circling)
-    speed_reward = 1.0 + max(speed, 0.0)
+    forward_vel = float(info.get("forward_vel", speed))
 
-    # CTE bell curve (from image-based estimator)
+    # Forward velocity reward (circles have near-zero forward_vel)
+    speed_reward = 1.0 + max(forward_vel, 0.0)
+
+    # CTE bell curve
     cte_reward = 2.0 * np.exp(-(cte / 1.0) ** 2)
 
     # Steering smoothness
     steer_change_penalty = 0.2 * (steering - last_steering) ** 2
 
-    # Steering magnitude penalty (circles need constant high steering)
-    steer_magnitude_penalty = 0.5 * steering ** 2
-
-    # Yaw rate penalty from gyro (directly detects spinning)
-    gyro = info.get("gyro", (0, 0, 0))
-    yaw_rate = abs(float(gyro[1]))
-    yaw_rate_penalty = 0.3 * min(yaw_rate, 2.0)
+    # Steering magnitude penalty
+    steer_magnitude_penalty = 0.3 * steering ** 2
 
     reward = (speed_reward + cte_reward
-              - steer_change_penalty - steer_magnitude_penalty
-              - yaw_rate_penalty)
+              - steer_change_penalty - steer_magnitude_penalty)
 
     if terminated:
         reward = -10.0
@@ -261,10 +255,8 @@ def train(args):
             episode_reward = 0.0
             episode_steps = 0
             last_steering = 0.0
-            # Dead reckoning (pos/vel/forward_vel are all zeros in this sim)
-            dr_x, dr_z = 0.0, 0.0
-            last_yaw = None
-            cum_yaw = 0.0
+            start_pos = None
+            max_displacement = 0.0
             t0 = time.time()
 
             # Decay exploration noise
@@ -307,18 +299,13 @@ def train(args):
                     done,
                 )
 
-                # Dead-reckon displacement (pos is always 0,0,0 in this sim)
-                car = info.get("car", (0, 0, 0))
-                yaw_deg = float(car[1])
-                yaw_rad = np.radians(yaw_deg)
-                if last_yaw is not None:
-                    dyaw = yaw_deg - last_yaw
-                    if dyaw > 180: dyaw -= 360
-                    elif dyaw < -180: dyaw += 360
-                    cum_yaw += abs(dyaw)
-                last_yaw = yaw_deg
-                dr_x += speed * np.sin(yaw_rad) * 0.05
-                dr_z += speed * np.cos(yaw_rad) * 0.05
+                # Track displacement from real pos (requires extendedTelemetry)
+                cur_pos = info.get("pos", (0, 0, 0))
+                if start_pos is None:
+                    start_pos = cur_pos
+                dx = cur_pos[0] - start_pos[0]
+                dz = cur_pos[2] - start_pos[2]
+                max_displacement = max(max_displacement, (dx**2 + dz**2)**0.5)
 
                 episode_reward += reward
                 episode_steps += 1
@@ -333,11 +320,10 @@ def train(args):
             dt = time.time() - t0
             avg_reward = episode_reward / max(episode_steps, 1)
             expl = agent.cfg.expl_amount if not is_seed else 'seed'
-            dr_disp = (dr_x**2 + dr_z**2) ** 0.5
             logger.info(
                 f'Episode {episode}: steps={episode_steps}, '
                 f'reward={episode_reward:.1f} (avg={avg_reward:.2f}/step), '
-                f'dr_disp={dr_disp:.1f}m, cum_yaw={cum_yaw:.0f}deg, '
+                f'disp={max_displacement:.1f}m, '
                 f'buffer={agent.D.steps}, expl={expl}, time={dt:.1f}s'
             )
 
@@ -345,8 +331,7 @@ def train(args):
                 writer.add_scalar('episode/reward', episode_reward, episode)
                 writer.add_scalar('episode/steps', episode_steps, episode)
                 writer.add_scalar('episode/total_steps', total_steps, episode)
-                writer.add_scalar('episode/dr_displacement', dr_disp, episode)
-                writer.add_scalar('episode/cumulative_yaw', cum_yaw, episode)
+                writer.add_scalar('episode/displacement', max_displacement, episode)
                 if not is_seed:
                     writer.add_scalar('episode/expl_noise',
                                       agent.cfg.expl_amount, episode)
@@ -383,9 +368,8 @@ def train(args):
                 test_reward = 0.0
                 test_steps = 0
                 test_done = False
-                t_dr_x, t_dr_z = 0.0, 0.0
-                t_last_yaw = None
-                t_cum_yaw = 0.0
+                test_start = None
+                test_max_disp = 0.0
 
                 with torch.no_grad():
                     while not test_done and test_steps < args.max_steps:
@@ -406,24 +390,18 @@ def train(args):
                             test_action, dtype=torch.float32,
                             device=device).unsqueeze(0)
 
-                        tc = test_info.get("car", (0, 0, 0))
-                        tyaw = float(tc[1])
-                        tyaw_rad = np.radians(tyaw)
-                        if t_last_yaw is not None:
-                            dy = tyaw - t_last_yaw
-                            if dy > 180: dy -= 360
-                            elif dy < -180: dy += 360
-                            t_cum_yaw += abs(dy)
-                        t_last_yaw = tyaw
-                        t_dr_x += test_speed * np.sin(tyaw_rad) * 0.05
-                        t_dr_z += test_speed * np.cos(tyaw_rad) * 0.05
+                        tp = test_info.get("pos", (0, 0, 0))
+                        if test_start is None:
+                            test_start = tp
+                        td = ((tp[0]-test_start[0])**2 +
+                              (tp[2]-test_start[2])**2)**0.5
+                        test_max_disp = max(test_max_disp, td)
 
-                t_dr_disp = (t_dr_x**2 + t_dr_z**2) ** 0.5
                 test_avg = test_reward / max(test_steps, 1)
                 logger.info(
                     f'  TEST ep {episode}: steps={test_steps}, '
                     f'reward={test_reward:.1f} (avg={test_avg:.2f}/step), '
-                    f'dr_disp={t_dr_disp:.1f}m, cum_yaw={t_cum_yaw:.0f}deg')
+                    f'disp={test_max_disp:.1f}m')
                 if writer:
                     writer.add_scalar('test/reward', test_reward, episode)
                     writer.add_scalar('test/steps', test_steps, episode)
