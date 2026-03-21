@@ -71,7 +71,7 @@ DREAMER_UNIMIX = 0.01           # uniform noise mixed into categoricals
 
 # World model training
 DREAMER_WORLD_LR = 1e-4
-DREAMER_ACTOR_LR = 3e-5
+DREAMER_ACTOR_LR = 8e-5
 DREAMER_VALUE_LR = 8e-5
 DREAMER_ADAM_EPS = 1e-8
 DREAMER_BATCH_SIZE = 64
@@ -94,7 +94,7 @@ DREAMER_RETURN_NORM_LOW = 5     # lower percentile
 DREAMER_RETURN_NORM_HIGH = 95   # upper percentile
 
 # Actor
-DREAMER_ACTOR_ENTROPY = 3e-4   # entropy regularization (paper: 3e-4 for continuous)
+DREAMER_ACTOR_ENTROPY = 1e-4   # entropy reg (reduced: EXPL_AMOUNT provides exploration)
 DREAMER_ACTOR_MIN_STD = 0.2    # minimum action std (prevents premature collapse)
 DREAMER_ACTOR_INIT_STD = 0.1   # initial action std — low so tanh outputs stay near zero initially
 DREAMER_EXPL_AMOUNT = 0.3      # exploration noise std (added to actions during training)

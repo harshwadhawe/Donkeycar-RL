@@ -618,7 +618,9 @@ class Dreamer:
                 self._gradient_step_count += 1
                 continue
 
-            # ── Actor (Latent Imagination) ───────────────
+            # ── Actor (REINFORCE in Imagination) ───────────────
+            # Use REINFORCE instead of dynamics-based gradients to prevent
+            # the actor from exploiting the imperfect world model.
             for p in self._world_params():
                 p.requires_grad_(False)
             for p in self.value_model.parameters():
@@ -627,84 +629,93 @@ class Dreamer:
             flat_belief = beliefs.detach().reshape(-1, bs)
             flat_state = posterior_states.detach().reshape(-1, ss)
 
+            # Imagination rollout — detach actions for RSSM so no dynamics
+            # gradient flows through the actor. Collect actions for log_prob.
             imag_beliefs = [flat_belief]
             imag_states = [flat_state]
+            imag_actions_list = []
 
-            for _ in range(cfg.DREAMER_PLANNING_HORIZON):
-                imag_feat = torch.cat(
-                    [imag_beliefs[-1], imag_states[-1]], dim=-1
-                )
-                imag_action = self.actor.sample_action(imag_feat, explore=False)
-                new_belief, new_state = self.rssm.imagine_step(
-                    imag_states[-1], imag_action, imag_beliefs[-1]
-                )
-                imag_beliefs.append(new_belief)
-                imag_states.append(new_state)
+            with torch.no_grad():
+                for _ in range(cfg.DREAMER_PLANNING_HORIZON):
+                    imag_feat = torch.cat(
+                        [imag_beliefs[-1], imag_states[-1]], dim=-1
+                    )
+                    imag_action = self.actor.sample_action(
+                        imag_feat, explore=True
+                    )
+                    imag_actions_list.append(imag_action)
+                    new_belief, new_state = self.rssm.imagine_step(
+                        imag_states[-1], imag_action, imag_beliefs[-1]
+                    )
+                    imag_beliefs.append(new_belief)
+                    imag_states.append(new_state)
 
             imag_beliefs = torch.stack(imag_beliefs)     # (H+1, T*B, bs)
             imag_states = torch.stack(imag_states)       # (H+1, T*B, ss)
             imag_features = torch.cat([imag_beliefs, imag_states], dim=-1)
+            imag_actions = torch.stack(imag_actions_list)  # (H, T*B, act)
 
-            # Predict rewards and values via twohot decoding
-            imag_reward_logits = bottle(
-                self.reward_model, [imag_features[:-1]]
-            )  # (H, T*B, NUM_BINS)
-            imag_rewards = symexp(
-                twohot_decode(imag_reward_logits, bins)
-            ).unsqueeze(-1)  # (H, T*B, 1)
-
-            imag_value_logits = bottle(
-                self.value_target, [imag_features]
-            )  # (H+1, T*B, NUM_BINS)
-            imag_values = symexp(
-                twohot_decode(imag_value_logits, bins)
-            ).unsqueeze(-1)  # (H+1, T*B, 1)
-
-            if self.continue_model is not None:
-                imag_cont = bottle(
-                    self.continue_model, [imag_features[:-1]]
-                )
-            else:
-                imag_cont = torch.ones_like(imag_rewards)
-
-            # Lambda returns
-            returns = compute_lambda_returns(
-                imag_rewards, imag_values, imag_cont,
-                cfg.DREAMER_GAMMA, cfg.DREAMER_DISCLAM
-            )  # (H, T*B, 1)
-
-            # Compute advantages (return - value baseline)
-            # baseline is detached; returns keeps gradients through actor
+            # Predict rewards and values via twohot decoding (all detached)
             with torch.no_grad():
+                imag_reward_logits = bottle(
+                    self.reward_model, [imag_features[:-1]]
+                )
+                imag_rewards = symexp(
+                    twohot_decode(imag_reward_logits, bins)
+                ).unsqueeze(-1)
+
+                imag_value_logits = bottle(
+                    self.value_target, [imag_features]
+                )
+                imag_values = symexp(
+                    twohot_decode(imag_value_logits, bins)
+                ).unsqueeze(-1)
+
+                if self.continue_model is not None:
+                    imag_cont = bottle(
+                        self.continue_model, [imag_features[:-1]]
+                    )
+                else:
+                    imag_cont = torch.ones_like(imag_rewards)
+
+                returns = compute_lambda_returns(
+                    imag_rewards, imag_values, imag_cont,
+                    cfg.DREAMER_GAMMA, cfg.DREAMER_DISCLAM
+                )
+
                 baseline_logits = bottle(
                     self.value_model, [imag_features[:-1]]
                 )
                 baseline = symexp(
                     twohot_decode(baseline_logits, bins)
-                ).unsqueeze(-1)  # (H, T*B, 1)
+                ).unsqueeze(-1)
 
-            advantages = returns - baseline  # returns has grads, baseline detached
+                advantages = returns - baseline
 
-            # Percentile normalization (compute scale from detached values)
-            with torch.no_grad():
                 flat_adv = advantages.flatten()
                 low = torch.quantile(flat_adv, cfg.DREAMER_RETURN_NORM_LOW / 100.0)
                 high = torch.quantile(flat_adv, cfg.DREAMER_RETURN_NORM_HIGH / 100.0)
                 scale = torch.clamp(high - low, min=1.0)
-            # Apply scale but keep gradient through returns
-            normalized_adv = (advantages - low.detach()) / scale.detach()
+                normalized_adv = (advantages - low) / scale
 
-            # Actor loss: dynamics-based gradient flows through returns → actor
-            actor_entropy = bottle(
-                self.actor.entropy, [imag_features[:-1]]
+            # REINFORCE: gradient flows through log_prob only, not dynamics
+            log_probs = bottle(
+                self.actor.log_prob,
+                [imag_features[:-1].detach(), imag_actions.detach()]
             )  # (H, T*B, 1)
+
+            actor_entropy = bottle(
+                self.actor.entropy, [imag_features[:-1].detach()]
+            )  # (H, T*B, 1)
+
             actor_loss = -(
-                normalized_adv + cfg.DREAMER_ACTOR_ENTROPY * actor_entropy
+                log_probs * normalized_adv
+                + cfg.DREAMER_ACTOR_ENTROPY * actor_entropy
             ).mean()
 
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
-            nn.utils.clip_grad_norm_(self.actor.parameters(), 10.0)  # tighter than world model
+            nn.utils.clip_grad_norm_(self.actor.parameters(), 10.0)
             self.actor_optimizer.step()
 
             # Unfreeze

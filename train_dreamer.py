@@ -197,6 +197,11 @@ class RewardShapingWrapper(gym.Wrapper):
     Uses: forward_vel, cte, pos (all real values with extended telemetry).
     """
 
+    # Circling detection: if car drives N steps but stays within a small area
+    CIRCLE_CHECK_INTERVAL = 50   # check every N steps
+    CIRCLE_MIN_DISPLACEMENT = 3.0  # must move at least this far (meters) per window
+    CIRCLE_MAX_CTE = 2.0        # avg |CTE| above this over window = off-track
+
     def __init__(self, env, max_episode_steps=None):
         super().__init__(env)
         self.episode_step = 0
@@ -204,11 +209,18 @@ class RewardShapingWrapper(gym.Wrapper):
         self.last_steering = 0.0
         self.stuck_count = 0
         self.stuck_threshold = 10
+        # Circling detection state
+        self._start_pos = None
+        self._window_pos = None  # position at start of current check window
+        self._window_ctes = []   # CTE values in current window
 
     def reset(self, **kwargs):
         self.episode_step = 0
         self.last_steering = 0.0
         self.stuck_count = 0
+        self._start_pos = None
+        self._window_pos = None
+        self._window_ctes = []
         return self.env.reset(**kwargs)
 
     def step(self, action):
@@ -219,6 +231,7 @@ class RewardShapingWrapper(gym.Wrapper):
         cte = float(info.get("cte", 0.0))
         speed = float(info.get("speed", 0.0))
         steering = float(np.asarray(action)[0]) if hasattr(action, '__len__') else 0.0
+        cur_pos = info.get("pos", None)
 
         # Forward velocity reward (circles have near-zero forward_vel)
         speed_reward = 1.0 + max(forward_vel, 0.0)
@@ -248,6 +261,32 @@ class RewardShapingWrapper(gym.Wrapper):
 
         if abs(cte) > 2.5:
             terminated = True
+
+        # ── Circling early termination ──
+        # Every CIRCLE_CHECK_INTERVAL steps, verify the car actually moved
+        # and stayed near the track. Circles have high |CTE| + low displacement.
+        if cur_pos is not None:
+            if self._start_pos is None:
+                self._start_pos = cur_pos
+            if self._window_pos is None:
+                self._window_pos = cur_pos
+            self._window_ctes.append(abs(cte))
+
+            if self.episode_step % self.CIRCLE_CHECK_INTERVAL == 0 and self.episode_step > 0:
+                dx = cur_pos[0] - self._window_pos[0]
+                dz = cur_pos[2] - self._window_pos[2]
+                window_disp = (dx**2 + dz**2) ** 0.5
+                window_avg_cte = np.mean(self._window_ctes) if self._window_ctes else 0.0
+
+                # Circling = not moving much OR way off-track for sustained period
+                if (window_disp < self.CIRCLE_MIN_DISPLACEMENT and
+                        window_avg_cte > self.CIRCLE_MAX_CTE):
+                    terminated = True
+                    info["circle_terminated"] = True
+
+                # Reset window
+                self._window_pos = cur_pos
+                self._window_ctes = []
 
         if terminated or truncated:
             reward -= 10.0
@@ -364,6 +403,11 @@ def train(args):
 
     total_steps = 0
     best_reward = -float('inf')
+    best_test_score = -float('inf')  # displacement-based, ignores fake laps
+
+    # Lap validation: multi-factor (not just time)
+    real_lap_count = 0
+    fake_lap_count = 0
 
     logger.info("=" * 60)
     logger.info(f"DREAMER v3 TRAINING")
@@ -384,6 +428,14 @@ def train(args):
             episode_steers = []
             start_pos = None
             max_displacement = 0.0
+            ep_real_laps = 0
+            ep_fake_laps = 0
+            last_lap_time = None  # track sim-reported lap time changes
+            # Per-lap-window metrics (reset each time a lap completes)
+            lap_window_ctes = []
+            lap_window_fwd_vels = []
+            lap_window_max_disp = 0.0
+            lap_window_start_pos = None
             t0 = time.time()
 
             is_seed = episode < cfg.DREAMER_SEED_EPISODES
@@ -424,6 +476,58 @@ def train(args):
                 dz = cur_pos[2] - start_pos[2]
                 max_displacement = max(max_displacement, (dx**2 + dz**2)**0.5)
 
+                # Accumulate per-lap-window metrics
+                lap_window_ctes.append(abs(step_cte))
+                lap_window_fwd_vels.append(fwd_vel)
+                if lap_window_start_pos is None:
+                    lap_window_start_pos = cur_pos
+                ldx = cur_pos[0] - lap_window_start_pos[0]
+                ldz = cur_pos[2] - lap_window_start_pos[2]
+                lap_window_max_disp = max(lap_window_max_disp,
+                                          (ldx**2 + ldz**2)**0.5)
+
+                # Detect and classify laps — multi-factor validation
+                cur_lap_time = info.get("last_lap_time", None)
+                if cur_lap_time is not None:
+                    cur_lap_time = float(cur_lap_time)
+                    if last_lap_time is None or abs(cur_lap_time - last_lap_time) > 0.1:
+                        # New lap reported by sim — validate it
+                        avg_lap_cte = (np.mean(lap_window_ctes)
+                                       if lap_window_ctes else 99.0)
+                        avg_lap_fwd = (np.mean(lap_window_fwd_vels)
+                                       if lap_window_fwd_vels else 0.0)
+                        lap_disp = lap_window_max_disp
+
+                        # Real lap: stayed on track + covered ground + moved forward
+                        is_real = (avg_lap_cte < 2.0 and
+                                   lap_disp > 5.0 and
+                                   avg_lap_fwd > 0.3)
+
+                        if is_real:
+                            ep_real_laps += 1
+                            real_lap_count += 1
+                            logger.info(
+                                f'  REAL LAP {cur_lap_time:.1f}s '
+                                f'(|cte|={avg_lap_cte:.2f}, '
+                                f'disp={lap_disp:.1f}m, '
+                                f'fwd={avg_lap_fwd:.2f}) '
+                                f'ep {episode} step {episode_steps}')
+                        elif cur_lap_time > 0.5:
+                            ep_fake_laps += 1
+                            fake_lap_count += 1
+                            logger.debug(
+                                f'  FAKE LAP {cur_lap_time:.1f}s '
+                                f'(|cte|={avg_lap_cte:.2f}, '
+                                f'disp={lap_disp:.1f}m, '
+                                f'fwd={avg_lap_fwd:.2f})')
+
+                        last_lap_time = cur_lap_time
+                        # Reset lap window for next lap
+                        lap_window_ctes = []
+                        lap_window_fwd_vels = []
+                        lap_window_max_disp = 0.0
+                        lap_window_start_pos = cur_pos
+
                 # Diagnostic: first episode
                 if episode == 0 and episode_steps == 1:
                     logger.info(f'FIRST STEP INFO KEYS: {sorted(info.keys())}')
@@ -446,13 +550,20 @@ def train(args):
             avg_fwd = np.mean(episode_fwd_vels) if episode_fwd_vels else 0.0
             avg_cte = np.mean(np.abs(episode_ctes)) if episode_ctes else 0.0
             avg_steer = np.mean(episode_steers) if episode_steers else 0.0
+            lap_str = ''
+            if ep_real_laps or ep_fake_laps:
+                lap_str = f', laps={ep_real_laps}real/{ep_fake_laps}fake'
+            circle_str = ''
+            if info.get("circle_terminated"):
+                circle_str = ' [CIRCLE KILLED]'
             logger.info(
                 f'Episode {episode}: steps={episode_steps}, '
                 f'reward={episode_reward:.1f} (avg={avg_reward:.2f}/step), '
                 f'fwd_vel={avg_fwd:.2f}, |steer|={avg_steer:.2f}, '
                 f'|cte|={avg_cte:.2f}, disp={max_displacement:.1f}m, '
                 f'buffer={buffer.total_steps}, '
-                f'{"seed" if is_seed else "policy"}, '
+                f'{"seed" if is_seed else "policy"}'
+                f'{lap_str}{circle_str}, '
                 f'time={dt:.1f}s'
             )
 
@@ -523,6 +634,13 @@ def train(args):
                 test_done = False
                 test_start = None
                 test_max_disp = 0.0
+                test_real_laps = 0
+                test_fake_laps = 0
+                test_last_lap = None
+                test_lap_ctes = []
+                test_lap_fwds = []
+                test_lap_max_disp_w = 0.0
+                test_lap_start = None
 
                 with torch.no_grad():
                     while not test_done and test_steps < cfg.DREAMER_MAX_EPISODE_STEPS:
@@ -542,15 +660,64 @@ def train(args):
                               (tp[2]-test_start[2])**2)**0.5
                         test_max_disp = max(test_max_disp, td)
 
+                        # Accumulate per-lap-window metrics
+                        t_cte = abs(float(test_info.get("cte", 0.0)))
+                        t_fwd = float(test_info.get("forward_vel", 0.0))
+                        test_lap_ctes.append(t_cte)
+                        test_lap_fwds.append(t_fwd)
+                        if test_lap_start is None:
+                            test_lap_start = tp
+                        tld = ((tp[0]-test_lap_start[0])**2 +
+                               (tp[2]-test_lap_start[2])**2)**0.5
+                        test_lap_max_disp_w = max(test_lap_max_disp_w, tld)
+
+                        # Validate laps — same multi-factor check
+                        tlt = test_info.get("last_lap_time", None)
+                        if tlt is not None:
+                            tlt = float(tlt)
+                            if test_last_lap is None or abs(tlt - test_last_lap) > 0.1:
+                                avg_c = np.mean(test_lap_ctes) if test_lap_ctes else 99.0
+                                avg_f = np.mean(test_lap_fwds) if test_lap_fwds else 0.0
+                                is_real = (avg_c < 2.0 and
+                                           test_lap_max_disp_w > 5.0 and
+                                           avg_f > 0.3)
+                                if is_real:
+                                    test_real_laps += 1
+                                elif tlt > 0.5:
+                                    test_fake_laps += 1
+                                test_last_lap = tlt
+                                # Reset window
+                                test_lap_ctes = []
+                                test_lap_fwds = []
+                                test_lap_max_disp_w = 0.0
+                                test_lap_start = tp
+
                 test_avg = test_reward / max(test_steps, 1)
+                test_lap_str = ''
+                if test_real_laps or test_fake_laps:
+                    test_lap_str = f', laps={test_real_laps}real/{test_fake_laps}fake'
                 logger.info(
                     f'  TEST ep {episode}: steps={test_steps}, '
                     f'reward={test_reward:.1f} (avg={test_avg:.2f}/step), '
-                    f'disp={test_max_disp:.1f}m')
+                    f'disp={test_max_disp:.1f}m'
+                    f'{test_lap_str}')
                 if writer:
                     writer.add_scalar('test/reward', test_reward, episode)
                     writer.add_scalar('test/steps', test_steps, episode)
                     writer.add_scalar('test/displacement', test_max_disp, episode)
+                    writer.add_scalar('test/real_laps', test_real_laps, episode)
+
+                # Save best model based on test performance
+                # Score: displacement + big bonus per real lap
+                test_score = test_max_disp + test_real_laps * 50.0
+                if test_score > best_test_score:
+                    best_test_score = test_score
+                    best_path = model_path.replace('.pth', '_best_test.pth')
+                    dreamer.save(best_path)
+                    logger.info(
+                        f'  New best test score {test_score:.1f} '
+                        f'(disp={test_max_disp:.1f}, real_laps={test_real_laps}), '
+                        f'saved to {best_path}')
 
             # Save checkpoint
             if episode_reward > best_reward:
@@ -563,6 +730,11 @@ def train(args):
                     '.pth', f'_ep{episode + 1}.pth'
                 )
                 dreamer.save(checkpoint_path)
+                logger.info(
+                    f'Checkpoint ep {episode + 1} | '
+                    f'total real laps: {real_lap_count}, '
+                    f'total fake laps: {fake_lap_count}'
+                )
 
     except KeyboardInterrupt:
         logger.info('Interrupted by user')
