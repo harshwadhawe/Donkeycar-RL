@@ -108,10 +108,13 @@ class RewardShapingWrapper(gym.Wrapper):
         self.episode_step = 0
         self.max_episode_steps = max_episode_steps or cfg.DREAMER_MAX_EPISODE_STEPS
         self.last_steering = 0.0
+        self.stuck_count = 0          # consecutive low-speed steps
+        self.stuck_threshold = 10     # terminate after this many stuck steps
 
     def reset(self, **kwargs):
         self.episode_step = 0
         self.last_steering = 0.0
+        self.stuck_count = 0
         return self.env.reset(**kwargs)
 
     def step(self, action):
@@ -120,30 +123,56 @@ class RewardShapingWrapper(gym.Wrapper):
 
         speed = float(info.get("speed", 0.0))
         cte = float(info.get("cte", 0.0))
+        steering = float(np.asarray(action)[0]) if hasattr(action, '__len__') else 0.0
 
-        # CTE bell curve — WIDER sigma (1.0) so agent gets gradient
-        # even when moderately off-center. sigma=0.35 was too tight.
+        # CTE bell curve — wider sigma so agent gets gradient off-center
         cte_reward = 3.0 * np.exp(-(cte / 1.0) ** 2)
 
         # Speed reward — only forward progress matters
         speed_reward = 0.5 * max(speed, 0.0)
 
-        # Survival bonus (constant, not ramped — we want immediate signal)
+        # Survival bonus
         survival = 0.1
 
         reward = cte_reward + speed_reward + survival
 
-        # Steering smoothness penalty — punish back-and-forth oscillation
-        steering = float(np.asarray(action)[0]) if hasattr(action, '__len__') else 0.0
+        # Anti-circling: only penalize steering that doesn't help track-following.
+        # If CTE is positive (car is right of center), negative steering (left)
+        # is corrective. Penalize steering that pushes AWAY from center or
+        # excessive steering when already centered.
+        #
+        # cte > 0 means car is right of center, needs steer < 0 (left)
+        # cte < 0 means car is left of center, needs steer > 0 (right)
+        # So corrective steering has sign(steering) != sign(cte), i.e. steering * cte < 0
+        if abs(cte) < 0.3:
+            # Already centered — penalize any large steering (no reason to turn)
+            reward -= 1.0 * steering ** 2
+        elif steering * cte > 0:
+            # Steering AWAY from center — bad (this causes circling)
+            reward -= 2.0 * steering ** 2
+        # else: steering toward center — no penalty (corrective turn)
+
+        # Steering smoothness penalty — penalize rapid changes
         steer_diff = abs(steering - self.last_steering)
         reward -= 0.3 * steer_diff ** 2
         self.last_steering = steering
 
-        # Standstill penalty (mild)
+        # Standstill penalty + stuck detection
         if speed < 0.1:
             reward -= 0.5
+            self.stuck_count += 1
+        else:
+            self.stuck_count = 0
 
-        # Crash penalty — moderate (10, not 120!)
+        # Kill episode if car is stuck (pushing against wall, spinning, etc.)
+        if self.stuck_count >= self.stuck_threshold:
+            terminated = True
+
+        # Hard CTE termination — don't trust the sim to enforce max_cte
+        if abs(cte) > 3.0:
+            terminated = True
+
+        # Crash penalty
         if terminated or truncated:
             reward -= 10.0
 
@@ -273,6 +302,8 @@ def train(args):
 
             episode_reward = 0.0
             episode_steps = 0
+            episode_speeds = []
+            episode_ctes = []
             t0 = time.time()
 
             done = False
@@ -296,6 +327,9 @@ def train(args):
                 next_obs, reward, terminated, truncated, info = env.step(action)
                 done = terminated or truncated
 
+                episode_speeds.append(float(info.get("speed", 0.0)))
+                episode_ctes.append(float(info.get("cte", 0.0)))
+
                 # Store in buffer
                 buffer.add_step(obs, action, reward, done)
 
@@ -308,9 +342,12 @@ def train(args):
 
             dt = time.time() - t0
             avg_reward = episode_reward / max(episode_steps, 1)
+            avg_speed = np.mean(episode_speeds) if episode_speeds else 0.0
+            avg_cte = np.mean(np.abs(episode_ctes)) if episode_ctes else 0.0
             logger.info(
                 f'Episode {episode}: steps={episode_steps}, '
                 f'reward={episode_reward:.1f} (avg={avg_reward:.2f}/step), '
+                f'speed={avg_speed:.2f}, |cte|={avg_cte:.2f}, '
                 f'buffer={buffer.total_steps}, time={dt:.1f}s'
             )
 

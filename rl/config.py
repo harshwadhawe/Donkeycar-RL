@@ -57,7 +57,7 @@ VAE_L2_REG = True
 # Based on: Mastering Diverse Domains through World Models (arXiv:2301.04104)
 
 DREAMER_SEED_EPISODES = 10      # random episodes to seed the buffer
-DREAMER_GRADIENT_STEPS = 100    # world model updates per data collection
+DREAMER_GRADIENT_STEPS = 30     # world model updates per data collection (keep ~1:1 with new data)
 
 # RSSM — categorical latent state
 DREAMER_BELIEF_SIZE = 256       # GRU hidden (deterministic)

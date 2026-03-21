@@ -244,12 +244,11 @@ class CategoricalRSSM(nn.Module):
             probs = (1 - self.unimix) * probs + self.unimix * uniform
             logits = torch.log(probs + 1e-8)
 
-        # Straight-through: sample in forward, use probs in backward
+        # Actual categorical sample (NOT argmax — argmax kills stochasticity)
         probs = F.softmax(logits, dim=-1)
-        sample = torch.zeros_like(probs)
-        indices = probs.argmax(dim=-1, keepdim=True)
-        sample.scatter_(-1, indices, 1.0)
-        # Straight-through gradient
+        dist = OneHotCategorical(probs=probs)
+        sample = dist.sample()  # hard one-hot sample
+        # Straight-through gradient: forward uses sample, backward uses probs
         return sample + probs - probs.detach()
 
     def imagine_step(self, state, action, belief):
@@ -316,7 +315,9 @@ class ActorModel(nn.Module):
         self.fix_speed = fix_speed
         self.throttle_base = throttle_base
 
-        self.mlp = DreamerMLP(feature_size, 2 * action_size, hidden_size, num_layers)
+        # When fix_speed=True, only learn steering (1D action)
+        self._learned_dims = 1 if fix_speed else action_size
+        self.mlp = DreamerMLP(feature_size, 2 * self._learned_dims, hidden_size, num_layers)
 
     def forward(self, features):
         out = self.mlp(features)
@@ -329,21 +330,23 @@ class ActorModel(nn.Module):
         mean, std = self.forward(features)
         return Normal(mean, std)
 
-    def sample_action(self, features, explore=False, expl_amount=0.3):
+    def sample_action(self, features, explore=False, **kwargs):
         dist = self.get_dist(features)
         if explore:
-            # rsample already adds noise via the distribution std
             action = dist.rsample()
         else:
             action = dist.mean
         action = torch.tanh(action)
 
         if self.fix_speed:
-            throttle = torch.full_like(action[..., 1:2], self.throttle_base)
-            action = torch.cat([action[..., :1], throttle], dim=-1)
+            # action is (B, 1) steering only — append fixed throttle
+            throttle = torch.full_like(action[..., :1], self.throttle_base)
+            action = torch.cat([action, throttle], dim=-1)
         return action
 
     def log_prob(self, features, action):
+        if self.fix_speed:
+            action = action[..., :1]  # only steering is learned
         dist = self.get_dist(features)
         raw_action = torch.atanh(action.clamp(-0.999, 0.999))
         log_p = dist.log_prob(raw_action)
