@@ -225,8 +225,16 @@ def train(args):
     logger.info(f"  Model: {model_path}")
     logger.info("=" * 60)
 
+    # Exploration noise schedule: start high, decay to low
+    expl_start = 0.3
+    expl_end = 0.05
+    expl_decay_episodes = 150  # reach minimum by this episode
+
+    best_test_reward = -float('inf')
+
     try:
         for episode in range(args.episodes):
+            # ── Data Collection Episode ──────────────────
             raw_obs, info = env.reset()
             cte_estimator.reset()
             agent.reset_belief()
@@ -239,36 +247,38 @@ def train(args):
             last_steering = 0.0
             t0 = time.time()
 
+            # Decay exploration noise
+            is_seed = episode < args.seed_episodes
+            if not is_seed:
+                trained_ep = episode - args.seed_episodes
+                progress = min(trained_ep / expl_decay_episodes, 1.0)
+                current_expl = expl_start + (expl_end - expl_start) * progress
+                agent.cfg.expl_amount = current_expl
+
             done = False
             while not done and episode_steps < args.max_steps:
-                # Preprocess for the model
                 obs_tensor = preprocess_obs(raw_obs)  # (1, 1, 40, 40)
 
-                is_seed = episode < args.seed_episodes
                 if is_seed:
-                    # Random exploration (forward-biased)
                     steer = np.random.uniform(-0.5, 0.5)
                     action = np.array(
                         [steer, args.throttle_base], dtype=np.float32)
                 else:
+                    # Pure policy + exploration noise (no P-controller blend)
                     action = agent.select_action(
                         obs_tensor, last_action_tensor, explore=True)
 
-                # Step environment
                 next_raw_obs, sim_reward, terminated, truncated, info = \
                     env.step(action)
                 done = terminated or truncated
 
-                # CTE estimation
                 speed = float(info.get("speed", 0.0))
                 cte = cte_estimator.update(next_raw_obs, info)
 
-                # Reward shaping
                 reward = compute_reward(
                     info, speed, cte, terminated,
                     last_steering, float(action[0]))
 
-                # Store in replay buffer (preprocessed observation)
                 next_obs_tensor = preprocess_obs(next_raw_obs)
                 agent.D.append(
                     next_obs_tensor.squeeze(0),  # (1, 40, 40)
@@ -289,18 +299,22 @@ def train(args):
 
             dt = time.time() - t0
             avg_reward = episode_reward / max(episode_steps, 1)
+            expl = agent.cfg.expl_amount if not is_seed else 'seed'
             logger.info(
                 f'Episode {episode}: steps={episode_steps}, '
                 f'reward={episode_reward:.1f} (avg={avg_reward:.2f}/step), '
-                f'buffer={agent.D.steps}, time={dt:.1f}s'
+                f'buffer={agent.D.steps}, expl={expl}, time={dt:.1f}s'
             )
 
             if writer:
                 writer.add_scalar('episode/reward', episode_reward, episode)
                 writer.add_scalar('episode/steps', episode_steps, episode)
                 writer.add_scalar('episode/total_steps', total_steps, episode)
+                if not is_seed:
+                    writer.add_scalar('episode/expl_noise',
+                                      agent.cfg.expl_amount, episode)
 
-            # Train after seed episodes
+            # ── Training ─────────────────────────────────
             if episode >= args.seed_episodes:
                 logger.info(
                     f'Training for {args.gradient_steps} gradient steps...')
@@ -321,6 +335,52 @@ def train(args):
                         for k, v in metrics.items():
                             writer.add_scalar(f'train/{k}', v, episode)
 
+            # ── Test Episode (deterministic, every 10 eps) ──
+            if (episode >= args.seed_episodes and
+                    (episode + 1) % 10 == 0):
+                test_obs, test_info = env.reset()
+                cte_estimator.reset()
+                agent.reset_belief()
+                test_action = np.zeros(2, dtype=np.float32)
+                test_action_tensor = torch.zeros(1, 2, device=device)
+                test_reward = 0.0
+                test_steps = 0
+                test_done = False
+
+                with torch.no_grad():
+                    while not test_done and test_steps < args.max_steps:
+                        test_obs_t = preprocess_obs(test_obs)
+                        test_action = agent.select_action(
+                            test_obs_t, test_action_tensor, explore=False)
+                        test_obs, _, term, trunc, test_info = env.step(
+                            test_action)
+                        test_done = term or trunc
+
+                        test_speed = float(test_info.get("speed", 0.0))
+                        test_cte = cte_estimator.update(test_obs, test_info)
+                        test_reward += compute_reward(
+                            test_info, test_speed, test_cte, term,
+                            0.0, float(test_action[0]))
+                        test_steps += 1
+                        test_action_tensor = torch.tensor(
+                            test_action, dtype=torch.float32,
+                            device=device).unsqueeze(0)
+
+                test_avg = test_reward / max(test_steps, 1)
+                logger.info(
+                    f'  TEST ep {episode}: steps={test_steps}, '
+                    f'reward={test_reward:.1f} (avg={test_avg:.2f}/step)')
+                if writer:
+                    writer.add_scalar('test/reward', test_reward, episode)
+                    writer.add_scalar('test/steps', test_steps, episode)
+                    writer.add_scalar('test/avg_reward', test_avg, episode)
+
+                if test_reward > best_test_reward:
+                    best_test_reward = test_reward
+                    agent.save(model_path.replace('.pth', '_best_test.pth'))
+                    logger.info(
+                        f'  New best TEST reward {best_test_reward:.1f}')
+
             # Save checkpoint
             if episode_reward > best_reward:
                 best_reward = episode_reward
@@ -328,7 +388,7 @@ def train(args):
                 logger.info(
                     f'New best reward {best_reward:.1f}, saved to {model_path}')
 
-            if (episode + 1) % 10 == 0:
+            if (episode + 1) % 20 == 0:
                 checkpoint = model_path.replace(
                     '.pth', f'_ep{episode + 1}.pth')
                 agent.save(checkpoint)
@@ -347,10 +407,11 @@ def train(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Dreamer v1 baseline')
-    parser.add_argument('--episodes', type=int, default=100)
-    parser.add_argument('--model', type=str, default='models/dreamer_v1.pth')
+    parser.add_argument('--episodes', type=int, default=300)
+    parser.add_argument('--model', type=str, default='models/dreamer_v1_v2.pth')
     parser.add_argument('--track', type=str, default=None)
-    parser.add_argument('--resume', action='store_true')
+    parser.add_argument('--resume', action='store_true',
+                        help='Resume model weights from --model path')
     parser.add_argument('--myconfig', type=str, default='myconfig.py')
     parser.add_argument('--seed-episodes', type=int, default=5,
                         help='Random exploration episodes before training')
