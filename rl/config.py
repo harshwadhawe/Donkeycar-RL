@@ -56,7 +56,7 @@ VAE_L2_REG = True
 # ─── Dreamer v3 ──────────────────────────────────────────
 # Based on: Mastering Diverse Domains through World Models (arXiv:2301.04104)
 
-DREAMER_SEED_EPISODES = 20      # random episodes to seed the buffer
+DREAMER_SEED_EPISODES = 5       # random episodes to seed the buffer
 DREAMER_GRADIENT_STEPS = 50     # fallback if train_ratio can't be computed
 DREAMER_TRAIN_RATIO = 512       # paper default for DMC continuous control
 

@@ -191,11 +191,10 @@ class CTEEstimatorWrapper(gym.Wrapper):
 # ==============================================================================
 class RewardShapingWrapper(gym.Wrapper):
     """
-    Reward shaping for Dreamer: wider CTE bell, moderate penalties.
+    Reward shaping for Dreamer: forward progress, anti-circling.
 
-    Key design: rewards should be dense, informative, and NOT dominated
-    by a single penalty. The agent needs gradient signal for "slightly
-    better" trajectories, not just "everything is equally bad."
+    Uses forward_vel (not speed magnitude) to reward actual forward motion.
+    Penalizes high absolute steering to prevent circling.
     """
 
     def __init__(self, env, max_episode_steps=None):
@@ -203,8 +202,8 @@ class RewardShapingWrapper(gym.Wrapper):
         self.episode_step = 0
         self.max_episode_steps = max_episode_steps or cfg.DREAMER_MAX_EPISODE_STEPS
         self.last_steering = 0.0
-        self.stuck_count = 0          # consecutive low-speed steps
-        self.stuck_threshold = 10     # terminate after this many stuck steps
+        self.stuck_count = 0
+        self.stuck_threshold = 10
 
     def reset(self, **kwargs):
         self.episode_step = 0
@@ -217,46 +216,41 @@ class RewardShapingWrapper(gym.Wrapper):
         self.episode_step += 1
 
         speed = float(info.get("speed", 0.0))
-        cte = float(info.get("cte", 0.0))  # now estimated by CTEEstimatorWrapper
+        forward_vel = float(info.get("forward_vel", speed))
+        cte = float(info.get("cte", 0.0))
         steering = float(np.asarray(action)[0]) if hasattr(action, '__len__') else 0.0
 
-        # CTE bell curve — CTE is now always available (estimated from image if needed)
-        cte_reward = 3.0 * np.exp(-(cte / 1.0) ** 2)
+        # Forward velocity reward (NOT speed magnitude — circles have speed but no forward_vel)
+        speed_reward = 1.0 + max(forward_vel, 0.0)
 
-        # Speed reward — only forward progress matters
-        speed_reward = 0.5 * max(speed, 0.0)
+        # CTE bell curve — stay near center
+        cte_reward = 2.0 * np.exp(-(cte / 1.0) ** 2)
 
-        # Survival bonus
-        survival = 0.1
+        # Steering smoothness — penalize jerky changes
+        steer_change_penalty = 0.2 * (steering - self.last_steering) ** 2
 
-        reward = cte_reward + speed_reward + survival
+        # Steering magnitude — penalize sustained high steering (circle signature)
+        steer_mag_penalty = 0.5 * steering ** 2
 
-        # Mild steering smoothness penalty only — keep reward simple
-        # so the world model can learn it. Complex rewards are hard to predict.
-        steer_diff = abs(steering - self.last_steering)
-        reward -= 0.2 * steer_diff ** 2
+        reward = speed_reward + cte_reward - steer_change_penalty - steer_mag_penalty
         self.last_steering = steering
 
-        # Standstill penalty + stuck detection
+        # Standstill detection
         if speed < 0.1:
             reward -= 0.5
             self.stuck_count += 1
         else:
             self.stuck_count = 0
 
-        # Kill episode if car is stuck (pushing against wall, spinning, etc.)
         if self.stuck_count >= self.stuck_threshold:
             terminated = True
 
-        # Terminate if estimated CTE is extreme (car far off track)
         if abs(cte) > 2.5:
             terminated = True
 
-        # Crash penalty
         if terminated or truncated:
             reward -= 10.0
 
-        # Episode step limit
         if self.episode_step >= self.max_episode_steps:
             truncated = True
 
@@ -385,65 +379,63 @@ def train(args):
             episode_reward = 0.0
             episode_steps = 0
             episode_speeds = []
+            episode_fwd_vels = []
             episode_ctes = []
+            episode_steers = []
+            start_pos = info.get("pos", (0, 0, 0))
+            max_displacement = 0.0
             t0 = time.time()
+
+            # Exploration noise schedule: decay from 0.3 to 0.05 over 150 eps
+            is_seed = episode < cfg.DREAMER_SEED_EPISODES
+            if not is_seed:
+                trained_ep = episode - cfg.DREAMER_SEED_EPISODES
+                expl_progress = min(trained_ep / 150.0, 1.0)
+                expl_noise = 0.3 + (0.05 - 0.3) * expl_progress
+            else:
+                expl_noise = 0.3
 
             done = False
             while not done:
-                # Select action
-                obs_tensor = torch.from_numpy(obs).unsqueeze(0)  # (1, C, H, W)
+                obs_tensor = torch.from_numpy(obs).unsqueeze(0)
                 action_tensor = torch.from_numpy(last_action).unsqueeze(0)
 
-                is_seed = episode < cfg.DREAMER_SEED_EPISODES
                 if is_seed:
-                    # Forward-biased random: mild steering, fixed throttle
-                    steer = np.random.uniform(-0.3, 0.3)
-                    throttle = cfg.DREAMER_THROTTLE_BASE
-                    action = np.array([steer, throttle], dtype=np.float32)
+                    steer = np.random.uniform(-0.5, 0.5)
+                    action = np.array([steer, cfg.DREAMER_THROTTLE_BASE],
+                                      dtype=np.float32)
                 else:
-                    policy_action = dreamer.select_action(
+                    # Pure policy — no P-controller blend
+                    action = dreamer.select_action(
                         obs_tensor, action_tensor, explore=True
                     )
-                    # Blend policy with P-controller that steers toward center.
-                    # Early on, mostly P-controller (keeps car on track so world
-                    # model gets useful data). Gradually shift to full policy.
-                    # CTE is now estimated from camera image by CTEEstimatorWrapper
-                    cte = float(info.get("cte", 0.0))
-                    corrective_steer = np.clip(-0.5 * cte, -0.8, 0.8)
-                    # blend: 0→1 over BLEND_EPISODES after seed phase
-                    # Slow ramp — world model needs thousands of steps before
-                    # the policy can be trusted
-                    blend_episodes = 300
-                    trained_ep = episode - cfg.DREAMER_SEED_EPISODES
-                    blend = min(trained_ep / blend_episodes, 1.0)
-                    steer = blend * policy_action[0] + (1 - blend) * corrective_steer
-                    # Add small exploration noise
-                    steer += np.random.normal(0, 0.05 * (1 - blend) + 0.02)
-                    steer = np.clip(steer, -1.0, 1.0)
-                    action = np.array([steer, cfg.DREAMER_THROTTLE_BASE], dtype=np.float32)
 
                 next_obs, reward, terminated, truncated, info = env.step(action)
                 done = terminated or truncated
 
                 step_speed = float(info.get("speed", 0.0))
+                step_fwd_vel = float(info.get("forward_vel", step_speed))
                 step_cte = float(info.get("cte", 0.0))
                 episode_speeds.append(step_speed)
+                episode_fwd_vels.append(step_fwd_vel)
                 episode_ctes.append(step_cte)
+                episode_steers.append(float(np.asarray(action)[0]))
 
-                # Diagnostic: log info dict on very first step, then CTE periodically
+                # Track displacement from start
+                cur_pos = info.get("pos", start_pos)
+                dx = cur_pos[0] - start_pos[0]
+                dz = cur_pos[2] - start_pos[2]
+                displacement = (dx**2 + dz**2) ** 0.5
+                max_displacement = max(max_displacement, displacement)
+
+                # Diagnostic: first episode info
                 if episode == 0 and episode_steps == 1:
                     logger.info(f'FIRST STEP INFO KEYS: {sorted(info.keys())}')
-                    logger.info(f'FIRST STEP INFO: cte={info.get("cte", "MISSING")}, '
-                                f'speed={info.get("speed", "MISSING")}, '
-                                f'pos={info.get("pos", "MISSING")}, '
-                                f'hit={info.get("hit", "MISSING")}')
-                if episode < 2 and episode_steps % 200 == 0:
-                    sim_r = float(info.get("sim_reward", 0.0))
-                    logger.info(f'  [ep{episode} step{episode_steps}] raw cte={step_cte:.6f}, '
-                                f'speed={step_speed:.3f}, steer={action[0]:.3f}, '
-                                f'sim_reward={sim_r:.3f}')
+                    logger.info(f'FIRST STEP INFO: cte={info.get("cte", "N/A")}, '
+                                f'speed={info.get("speed", "N/A")}, '
+                                f'forward_vel={info.get("forward_vel", "N/A")}, '
+                                f'pos={info.get("pos", "N/A")}')
 
-                # Store in buffer
                 buffer.add_step(obs, action, reward, done)
 
                 episode_reward += reward
@@ -456,22 +448,30 @@ def train(args):
             dt = time.time() - t0
             avg_reward = episode_reward / max(episode_steps, 1)
             avg_speed = np.mean(episode_speeds) if episode_speeds else 0.0
+            avg_fwd_vel = np.mean(episode_fwd_vels) if episode_fwd_vels else 0.0
             avg_cte = np.mean(np.abs(episode_ctes)) if episode_ctes else 0.0
+            avg_steer = np.mean(np.abs(episode_steers)) if episode_steers else 0.0
             logger.info(
                 f'Episode {episode}: steps={episode_steps}, '
                 f'reward={episode_reward:.1f} (avg={avg_reward:.2f}/step), '
-                f'speed={avg_speed:.2f}, |cte|={avg_cte:.2f}, '
-                f'buffer={buffer.total_steps}, time={dt:.1f}s'
+                f'fwd_vel={avg_fwd_vel:.2f}, |steer|={avg_steer:.2f}, '
+                f'|cte|={avg_cte:.2f}, disp={max_displacement:.1f}m, '
+                f'buffer={buffer.total_steps}, '
+                f'{"seed" if is_seed else f"expl={expl_noise:.3f}"}, '
+                f'time={dt:.1f}s'
             )
 
             if writer:
                 writer.add_scalar('episode/reward', episode_reward, episode)
                 writer.add_scalar('episode/steps', episode_steps, episode)
                 writer.add_scalar('episode/total_steps', total_steps, episode)
+                writer.add_scalar('episode/avg_fwd_vel', avg_fwd_vel, episode)
+                writer.add_scalar('episode/avg_abs_steer', avg_steer, episode)
+                writer.add_scalar('episode/max_displacement', max_displacement, episode)
+                writer.add_scalar('episode/avg_abs_cte', avg_cte, episode)
 
             # Train after seed episodes
             if episode >= cfg.DREAMER_SEED_EPISODES:
-                # Dynamic gradient steps: train_ratio * episode_steps / (batch * chunk)
                 gradient_steps = max(1, int(
                     episode_steps * cfg.DREAMER_TRAIN_RATIO /
                     (cfg.DREAMER_BATCH_SIZE * cfg.DREAMER_CHUNK_SIZE)
@@ -487,6 +487,8 @@ def train(args):
                     logger.info(
                         f'Training done in {dt:.1f}s | '
                         f'world={metrics["world_loss"]:.4f} '
+                        f'obs={metrics["obs_loss"]:.4f} '
+                        f'rew={metrics["reward_loss"]:.4f} '
                         f'actor={metrics["actor_loss"]:.4f} '
                         f'value={metrics["value_loss"]:.4f} '
                         f'kl={metrics["kl_loss"]:.4f}'
@@ -495,14 +497,54 @@ def train(args):
                         for k, v in metrics.items():
                             writer.add_scalar(f'train/{k}', v, episode)
 
+            # ── Test Episode (deterministic, every 10 eps) ──
+            if (episode >= cfg.DREAMER_SEED_EPISODES and
+                    (episode + 1) % 10 == 0):
+                test_obs, test_info = env.reset()
+                dreamer.reset_belief()
+                test_action = np.zeros(2, dtype=np.float32)
+                test_reward = 0.0
+                test_steps = 0
+                test_done = False
+                test_start = test_info.get("pos", (0, 0, 0))
+                test_max_disp = 0.0
+                test_steers = []
+
+                with torch.no_grad():
+                    while not test_done and test_steps < cfg.DREAMER_MAX_EPISODE_STEPS:
+                        test_obs_t = torch.from_numpy(test_obs).unsqueeze(0)
+                        test_act_t = torch.from_numpy(test_action).unsqueeze(0)
+                        test_action = dreamer.select_action(
+                            test_obs_t, test_act_t, explore=False)
+                        test_obs, r, term, trunc, test_info = env.step(test_action)
+                        test_done = term or trunc
+                        test_reward += r
+                        test_steps += 1
+                        test_steers.append(abs(float(test_action[0])))
+
+                        tp = test_info.get("pos", test_start)
+                        td = ((tp[0]-test_start[0])**2 +
+                              (tp[2]-test_start[2])**2) ** 0.5
+                        test_max_disp = max(test_max_disp, td)
+
+                test_avg = test_reward / max(test_steps, 1)
+                test_avg_steer = np.mean(test_steers) if test_steers else 0
+                logger.info(
+                    f'  TEST ep {episode}: steps={test_steps}, '
+                    f'reward={test_reward:.1f} (avg={test_avg:.2f}/step), '
+                    f'disp={test_max_disp:.1f}m, |steer|={test_avg_steer:.2f}')
+                if writer:
+                    writer.add_scalar('test/reward', test_reward, episode)
+                    writer.add_scalar('test/steps', test_steps, episode)
+                    writer.add_scalar('test/max_displacement', test_max_disp, episode)
+
             # Save checkpoint
             if episode_reward > best_reward:
                 best_reward = episode_reward
                 dreamer.save(model_path)
                 logger.info(f'New best reward {best_reward:.1f}, saved to {model_path}')
 
-            # Periodic save
-            if (episode + 1) % 10 == 0:
+            if (episode + 1) % 20 == 0:
                 checkpoint_path = model_path.replace(
                     '.pth', f'_ep{episode + 1}.pth'
                 )

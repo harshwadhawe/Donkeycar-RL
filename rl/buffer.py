@@ -136,35 +136,32 @@ class EpisodeBuffer:
             rewards:      (chunk_size, batch_size)
             dones:        (chunk_size, batch_size)
         """
-        # Find valid start positions from completed episodes
-        valid_starts = []
+        # Build valid episodes list (episode-level, not start-level — much faster)
+        valid_episodes = []
         for ep_start, ep_end in self._episodes:
-            # Compute episode length accounting for ring buffer wrap
             ep_len = (ep_end - ep_start) % self.max_steps + 1
-
-            # Valid starts: anywhere in episode where chunk_size fits
             if ep_len >= chunk_size:
-                for offset in range(ep_len - chunk_size + 1):
-                    valid_starts.append((ep_start + offset) % self.max_steps)
+                valid_episodes.append((ep_start, ep_len))
 
-        if len(valid_starts) == 0:
+        if len(valid_episodes) == 0:
             return None
 
-        # Sample batch_size starts
-        chosen = random.choices(valid_starts, k=batch_size)
-
+        # Sample: pick random episode, then random offset within it
         obs_chunks = np.zeros((chunk_size, batch_size, *self.obs_shape), dtype=np.float32)
         act_chunks = np.zeros((chunk_size, batch_size, self.action_dim), dtype=np.float32)
         rew_chunks = np.zeros((chunk_size, batch_size), dtype=np.float32)
         done_chunks = np.zeros((chunk_size, batch_size), dtype=np.float32)
 
-        for b, start in enumerate(chosen):
-            for t in range(chunk_size):
-                idx = (start + t) % self.max_steps
-                obs_chunks[t, b] = self.observations[idx]
-                act_chunks[t, b] = self.actions[idx]
-                rew_chunks[t, b] = self.rewards[idx]
-                done_chunks[t, b] = self.dones[idx]
+        for b in range(batch_size):
+            ep_start, ep_len = random.choice(valid_episodes)
+            offset = random.randint(0, ep_len - chunk_size)
+            start = (ep_start + offset) % self.max_steps
+
+            indices = [(start + t) % self.max_steps for t in range(chunk_size)]
+            obs_chunks[:, b] = self.observations[indices]
+            act_chunks[:, b] = self.actions[indices]
+            rew_chunks[:, b] = self.rewards[indices]
+            done_chunks[:, b] = self.dones[indices]
 
         return (
             torch.from_numpy(obs_chunks),

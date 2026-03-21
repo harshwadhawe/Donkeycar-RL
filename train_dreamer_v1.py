@@ -126,20 +126,32 @@ class CTEEstimator:
 
 
 # ==============================================================================
-# Reward Shaping (simple, matching reference repo style)
+# Reward Shaping — v3: anti-circling
 # ==============================================================================
 def compute_reward(info, speed, cte, terminated, last_steering, steering):
-    """Simple reward: speed-proportional + CTE bell curve + crash penalty."""
-    # Speed reward (reference: reward = 1 + normalized_speed)
-    speed_reward = 1.0 + max(speed, 0.0)
+    """Reward forward progress, penalize circling.
 
-    # CTE bell curve
+    Key changes from v2:
+    - Use forward_vel instead of speed (circles have speed but no forward vel)
+    - Heavy penalty for sustained high absolute steering (circle signature)
+    - Steering smoothness penalty increased
+    """
+    forward_vel = float(info.get("forward_vel", speed))
+
+    # Forward velocity reward (only reward actual forward motion)
+    speed_reward = 1.0 + max(forward_vel, 0.0)
+
+    # CTE bell curve (stay near center)
     cte_reward = 2.0 * np.exp(-(cte / 1.0) ** 2)
 
-    # Steering smoothness
-    steer_penalty = 0.1 * (steering - last_steering) ** 2
+    # Steering smoothness (penalize jerky steering changes)
+    steer_change_penalty = 0.2 * (steering - last_steering) ** 2
 
-    reward = speed_reward + cte_reward - steer_penalty
+    # High absolute steering penalty (circles require constant high steering)
+    steer_magnitude_penalty = 0.5 * steering ** 2
+
+    reward = (speed_reward + cte_reward
+              - steer_change_penalty - steer_magnitude_penalty)
 
     if terminated:
         reward = -10.0
@@ -245,6 +257,8 @@ def train(args):
             episode_reward = 0.0
             episode_steps = 0
             last_steering = 0.0
+            start_pos = info.get("pos", (0, 0, 0))
+            max_displacement = 0.0  # track max distance from start
             t0 = time.time()
 
             # Decay exploration noise
@@ -287,6 +301,13 @@ def train(args):
                     done,
                 )
 
+                # Track displacement from start (anti-circle diagnostic)
+                cur_pos = info.get("pos", start_pos)
+                dx = cur_pos[0] - start_pos[0]
+                dz = cur_pos[2] - start_pos[2]
+                displacement = (dx**2 + dz**2) ** 0.5
+                max_displacement = max(max_displacement, displacement)
+
                 episode_reward += reward
                 episode_steps += 1
                 total_steps += 1
@@ -303,6 +324,7 @@ def train(args):
             logger.info(
                 f'Episode {episode}: steps={episode_steps}, '
                 f'reward={episode_reward:.1f} (avg={avg_reward:.2f}/step), '
+                f'disp={max_displacement:.1f}m, '
                 f'buffer={agent.D.steps}, expl={expl}, time={dt:.1f}s'
             )
 
@@ -310,6 +332,8 @@ def train(args):
                 writer.add_scalar('episode/reward', episode_reward, episode)
                 writer.add_scalar('episode/steps', episode_steps, episode)
                 writer.add_scalar('episode/total_steps', total_steps, episode)
+                writer.add_scalar('episode/max_displacement',
+                                  max_displacement, episode)
                 if not is_seed:
                     writer.add_scalar('episode/expl_noise',
                                       agent.cfg.expl_amount, episode)
@@ -346,6 +370,8 @@ def train(args):
                 test_reward = 0.0
                 test_steps = 0
                 test_done = False
+                test_start_pos = test_info.get("pos", (0, 0, 0))
+                test_max_disp = 0.0
 
                 with torch.no_grad():
                     while not test_done and test_steps < args.max_steps:
@@ -366,10 +392,16 @@ def train(args):
                             test_action, dtype=torch.float32,
                             device=device).unsqueeze(0)
 
+                        tp = test_info.get("pos", test_start_pos)
+                        td = ((tp[0]-test_start_pos[0])**2 +
+                              (tp[2]-test_start_pos[2])**2) ** 0.5
+                        test_max_disp = max(test_max_disp, td)
+
                 test_avg = test_reward / max(test_steps, 1)
                 logger.info(
                     f'  TEST ep {episode}: steps={test_steps}, '
-                    f'reward={test_reward:.1f} (avg={test_avg:.2f}/step)')
+                    f'reward={test_reward:.1f} (avg={test_avg:.2f}/step), '
+                    f'disp={test_max_disp:.1f}m')
                 if writer:
                     writer.add_scalar('test/reward', test_reward, episode)
                     writer.add_scalar('test/steps', test_steps, episode)
@@ -408,7 +440,7 @@ def train(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Dreamer v1 baseline')
     parser.add_argument('--episodes', type=int, default=300)
-    parser.add_argument('--model', type=str, default='models/dreamer_v1_v2.pth')
+    parser.add_argument('--model', type=str, default='models/dreamer_v1_v3.pth')
     parser.add_argument('--track', type=str, default=None)
     parser.add_argument('--resume', action='store_true',
                         help='Resume model weights from --model path')
