@@ -13,7 +13,7 @@ from .model import VAE
 class VAEController:
     """Encodes camera images to VAE latent vectors."""
 
-    def __init__(self, model_path, z_dim=32, device=None):
+    def __init__(self, model_path, z_dim=64, device=None):
         if device is None:
             if torch.cuda.is_available():
                 device = 'cuda'

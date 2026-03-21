@@ -71,7 +71,7 @@ class DonkeyVAEWrapper(gym.ObservationWrapper):
 
     def __init__(self, env, vae_path, device):
         super().__init__(env)
-        self.vae = VAEController(model_path=vae_path, z_dim=32, device=device)
+        self.vae = VAEController(model_path=vae_path, z_dim=64, device=device)
         self.observation_space = gym.spaces.Box(
             low=-np.inf, high=np.inf, shape=(self.vae.z_dim,), dtype=np.float32
         )
@@ -292,7 +292,7 @@ def main():
     parser = argparse.ArgumentParser(description='SB3 SAC + VAE training')
     parser.add_argument('--timesteps', type=int, default=250_000,
                         help='Total training timesteps')
-    parser.add_argument('--vae', type=str, default='logs/vae/vae_z32_best.pth',
+    parser.add_argument('--vae', type=str, default='logs/vae/vae_z64_best.pth',
                         help='Path to trained VAE model')
     parser.add_argument('--track', type=str, default=None,
                         help='Gym env name (default: from myconfig.py)')

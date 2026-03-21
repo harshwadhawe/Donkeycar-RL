@@ -162,7 +162,7 @@ if __name__ == '__main__':
     parser.add_argument('--tub', type=str, required=True, help='Path to tub directory')
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch-size', type=int, default=64)
-    parser.add_argument('--z-dim', type=int, default=32)
+    parser.add_argument('--z-dim', type=int, default=64)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--kl-weight', type=float, default=1.0)
     args = parser.parse_args()

@@ -82,8 +82,8 @@ python train_dreamer.py --episodes=200                   # custom episode count
 
 # Linux: run training in background (survives terminal close)
 export DISPLAY=:0
-nohup python train_sac.py > logs/train_sac.log 2>&1 &
-nohup python train_dreamer.py > logs/train_dreamer.log 2>&1 &
+nohup python -u train_sac.py > logs/train_sac.log 2>&1 &
+nohup python -u train_dreamer.py > logs/train_dreamer.log 2>&1 &
 tail -f logs/train_sac.log                               # follow progress
 
 # Monitor training
