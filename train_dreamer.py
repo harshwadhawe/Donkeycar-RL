@@ -136,25 +136,10 @@ class RewardShapingWrapper(gym.Wrapper):
 
         reward = cte_reward + speed_reward + survival
 
-        # Anti-circling: only penalize steering that doesn't help track-following.
-        # If CTE is positive (car is right of center), negative steering (left)
-        # is corrective. Penalize steering that pushes AWAY from center or
-        # excessive steering when already centered.
-        #
-        # cte > 0 means car is right of center, needs steer < 0 (left)
-        # cte < 0 means car is left of center, needs steer > 0 (right)
-        # So corrective steering has sign(steering) != sign(cte), i.e. steering * cte < 0
-        if abs(cte) < 0.3:
-            # Already centered — penalize any large steering (no reason to turn)
-            reward -= 1.0 * steering ** 2
-        elif steering * cte > 0:
-            # Steering AWAY from center — bad (this causes circling)
-            reward -= 2.0 * steering ** 2
-        # else: steering toward center — no penalty (corrective turn)
-
-        # Steering smoothness penalty — penalize rapid changes
+        # Mild steering smoothness penalty only — keep reward simple
+        # so the world model can learn it. Complex rewards are hard to predict.
         steer_diff = abs(steering - self.last_steering)
-        reward -= 0.3 * steer_diff ** 2
+        reward -= 0.2 * steer_diff ** 2
         self.last_steering = steering
 
         # Standstill penalty + stuck detection
@@ -312,17 +297,32 @@ def train(args):
                 obs_tensor = torch.from_numpy(obs).unsqueeze(0)  # (1, C, H, W)
                 action_tensor = torch.from_numpy(last_action).unsqueeze(0)
 
-                explore = episode < cfg.DREAMER_SEED_EPISODES
-                if explore:
-                    # Forward-biased exploration: small random steering,
-                    # fixed throttle. Pure uniform [-1,1] creates garbage data.
-                    steer = np.random.uniform(-0.5, 0.5)
-                    throttle = cfg.DREAMER_THROTTLE_BASE + np.random.uniform(-0.1, 0.1)
+                is_seed = episode < cfg.DREAMER_SEED_EPISODES
+                if is_seed:
+                    # Forward-biased random: mild steering, fixed throttle
+                    steer = np.random.uniform(-0.3, 0.3)
+                    throttle = cfg.DREAMER_THROTTLE_BASE
                     action = np.array([steer, throttle], dtype=np.float32)
                 else:
-                    action = dreamer.select_action(
+                    policy_action = dreamer.select_action(
                         obs_tensor, action_tensor, explore=True
                     )
+                    # Blend policy with P-controller that steers toward center.
+                    # Early on, mostly P-controller (keeps car on track so world
+                    # model gets useful data). Gradually shift to full policy.
+                    cte = float(info.get("cte", 0.0))
+                    corrective_steer = np.clip(-0.5 * cte, -0.8, 0.8)
+                    # blend: 0→1 over BLEND_EPISODES after seed phase
+                    # Slow ramp — world model needs thousands of steps before
+                    # the policy can be trusted
+                    blend_episodes = 300
+                    trained_ep = episode - cfg.DREAMER_SEED_EPISODES
+                    blend = min(trained_ep / blend_episodes, 1.0)
+                    steer = blend * policy_action[0] + (1 - blend) * corrective_steer
+                    # Add small exploration noise
+                    steer += np.random.normal(0, 0.05 * (1 - blend) + 0.02)
+                    steer = np.clip(steer, -1.0, 1.0)
+                    action = np.array([steer, cfg.DREAMER_THROTTLE_BASE], dtype=np.float32)
 
                 next_obs, reward, terminated, truncated, info = env.step(action)
                 done = terminated or truncated

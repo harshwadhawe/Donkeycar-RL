@@ -56,7 +56,7 @@ VAE_L2_REG = True
 # ─── Dreamer v3 ──────────────────────────────────────────
 # Based on: Mastering Diverse Domains through World Models (arXiv:2301.04104)
 
-DREAMER_SEED_EPISODES = 10      # random episodes to seed the buffer
+DREAMER_SEED_EPISODES = 20      # random episodes to seed the buffer
 DREAMER_GRADIENT_STEPS = 30     # world model updates per data collection (keep ~1:1 with new data)
 
 # RSSM — categorical latent state
@@ -83,7 +83,7 @@ DREAMER_KL_REP_WEIGHT = 0.1    # representation loss: trains encoder
 DREAMER_KL_DYN_WEIGHT = 0.5    # dynamics loss: trains transition model
 
 # Behavior learning
-DREAMER_PLANNING_HORIZON = 15
+DREAMER_PLANNING_HORIZON = 8
 DREAMER_GAMMA = 0.997
 DREAMER_DISCLAM = 0.95         # lambda for GAE / lambda-returns
 DREAMER_PCONT = True           # use learned continue predictor
