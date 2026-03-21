@@ -253,20 +253,21 @@ class RewardShapingWrapper(gym.Wrapper):
         else:
             alpha = 1.0
 
-        # CTE bell curve — big positive reward for staying centered
+        # CTE bell curve — primary signal for staying centered
         # sigma=1.0: at cte=0 → 5.0, at cte=0.5 → 3.9, at cte=1.0 → 1.8
         cte_reward = 5.0 * np.exp(-(cte / 1.0) ** 2)
 
-        # Speed reward — ramps in with curriculum
-        # Early: small alive bonus so the car prefers moving over standing still
-        # Late: forward velocity adds on top
-        speed_reward = 0.5 + alpha * max(forward_vel, 0.0)
+        # Forward velocity — always present to distinguish driving from circling
+        # Circles have forward_vel ≈ 0, real driving has forward_vel ≈ 1.0-2.0
+        # Early: 1.0 * fwd_vel (secondary to CTE but enough to break ambiguity)
+        # Late: ramps up so speed matters more
+        fwd_vel_reward = (1.0 + alpha) * max(forward_vel, 0.0)
 
-        # Light penalties — don't overwhelm the positive CTE signal
+        # Light penalties — don't overwhelm the positive signals
         steer_change_penalty = 0.1 * (steering - self.last_steering) ** 2
         steer_mag_penalty = 0.15 * steering ** 2
 
-        reward = (cte_reward + speed_reward
+        reward = (cte_reward + fwd_vel_reward
                   - steer_change_penalty - steer_mag_penalty)
         self.last_steering = steering
 
