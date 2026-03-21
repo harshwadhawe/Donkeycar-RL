@@ -222,7 +222,7 @@ def train(args):
         "log_level": 20,
         "throttle_max": 1.0,
         "max_cte": 3.0,        # terminate early when hopelessly off-track
-        "start_delay": 2.0,    # faster episode starts
+        "start_delay": 5.0,    # give sim time to launch before connecting
     }
 
     logger.info(f'Track: {track}')

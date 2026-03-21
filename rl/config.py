@@ -74,7 +74,7 @@ DREAMER_ACTOR_LR = 8e-5
 DREAMER_VALUE_LR = 8e-5
 DREAMER_ADAM_EPS = 1e-8
 DREAMER_BATCH_SIZE = 16
-DREAMER_CHUNK_SIZE = 50         # sequence length for BPTT
+DREAMER_CHUNK_SIZE = 15         # sequence length for BPTT (must be < avg episode length)
 DREAMER_GRAD_CLIP = 100.0
 
 # KL balancing (replaces free nats)
