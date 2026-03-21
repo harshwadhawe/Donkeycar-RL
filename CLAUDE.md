@@ -11,7 +11,7 @@ This is a **Donkey Car** autonomous RC car application — a Python-based self-d
 Always activate the conda environment before running any commands:
 ```bash
 conda activate donkey
-pip install -r requirements.txt   # one-time: installs SB3, gymnasium, etc.
+pip install -r requirements.txt   # one-time: installs SB3, gymnasium, shimmy, etc.
 ```
 
 **PyTorch** must be installed separately for the correct backend:
@@ -20,6 +20,29 @@ pip install -r requirements.txt   # one-time: installs SB3, gymnasium, etc.
 pip install torch torchvision
 # Linux CUDA (e.g. RTX 4060):
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+```
+
+### Per-machine config (`myconfig.py`)
+
+`myconfig.py` is gitignored — create one on each machine with the correct sim path:
+
+```python
+# macOS
+DONKEY_GYM = True
+DONKEY_SIM_PATH = "/path/to/DonkeySimMac/donkey_sim.app/Contents/MacOS/donkey_sim"
+DONKEY_GYM_ENV_NAME = "donkey-generated-track-v0"
+
+# Linux (CUDA)
+DONKEY_GYM = True
+DONKEY_SIM_PATH = "/home/pistar/harsh/DonkeySimLinux/donkey_sim.x86_64"
+DONKEY_GYM_ENV_NAME = "donkey-generated-track-v0"
+```
+
+### Linux headless notes
+
+On Linux the Unity sim needs a display. Always set `DISPLAY` and use `nohup` so training survives terminal close:
+```bash
+export DISPLAY=:0
 ```
 
 ## Common Commands
@@ -56,7 +79,15 @@ python train_sac.py --timesteps=500000                  # custom timestep count
 python train_dreamer.py                                  # train from scratch
 python train_dreamer.py --resume                         # resume training
 python train_dreamer.py --episodes=200                   # custom episode count
-tensorboard --logdir ./logs/tb_logs/ --port 6006        # monitor training
+
+# Linux: run training in background (survives terminal close)
+export DISPLAY=:0
+nohup python train_sac.py > logs/train_sac.log 2>&1 &
+nohup python train_dreamer.py > logs/train_dreamer.log 2>&1 &
+tail -f logs/train_sac.log                               # follow progress
+
+# Monitor training
+tensorboard --logdir ./logs/tb_logs/ --port 6006
 ```
 
 ## Architecture
