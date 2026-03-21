@@ -96,7 +96,7 @@ DREAMER_RETURN_NORM_HIGH = 95   # upper percentile
 # Actor
 DREAMER_ACTOR_ENTROPY = 3e-4   # entropy regularization (paper: 3e-4 for continuous)
 DREAMER_ACTOR_MIN_STD = 0.2    # minimum action std (prevents premature collapse)
-DREAMER_ACTOR_INIT_STD = 1.0   # initial action std (before training) — higher = more uniform exploration
+DREAMER_ACTOR_INIT_STD = 0.1   # initial action std — low so tanh outputs stay near zero initially
 DREAMER_EXPL_AMOUNT = 0.3      # exploration noise std (added to actions during training)
 
 # Slow critic (EMA target, replaces hard target updates)
