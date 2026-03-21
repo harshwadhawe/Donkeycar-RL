@@ -57,7 +57,8 @@ VAE_L2_REG = True
 # Based on: Mastering Diverse Domains through World Models (arXiv:2301.04104)
 
 DREAMER_SEED_EPISODES = 20      # random episodes to seed the buffer
-DREAMER_GRADIENT_STEPS = 50     # world model updates per data collection
+DREAMER_GRADIENT_STEPS = 50     # fallback if train_ratio can't be computed
+DREAMER_TRAIN_RATIO = 512       # paper default for DMC continuous control
 
 # RSSM — categorical latent state
 DREAMER_BELIEF_SIZE = 256       # GRU hidden (deterministic)
@@ -74,7 +75,7 @@ DREAMER_ACTOR_LR = 8e-5
 DREAMER_VALUE_LR = 8e-5
 DREAMER_ADAM_EPS = 1e-8
 DREAMER_BATCH_SIZE = 64
-DREAMER_CHUNK_SIZE = 15         # sequence length for BPTT (must be < avg episode length)
+DREAMER_CHUNK_SIZE = 32         # sequence length for BPTT (paper uses 64, 32 fits 8GB VRAM)
 DREAMER_GRAD_CLIP = 100.0
 
 # KL balancing (replaces free nats)
@@ -93,7 +94,7 @@ DREAMER_RETURN_NORM_LOW = 5     # lower percentile
 DREAMER_RETURN_NORM_HIGH = 95   # upper percentile
 
 # Actor
-DREAMER_ACTOR_ENTROPY = 1e-3   # entropy regularization coefficient
+DREAMER_ACTOR_ENTROPY = 3e-4   # entropy regularization (paper: 3e-4 for continuous)
 DREAMER_ACTOR_MIN_STD = 0.1    # minimum action std
 DREAMER_ACTOR_INIT_STD = 0.5   # initial action std (before training)
 DREAMER_EXPL_AMOUNT = 0.15     # exploration noise std

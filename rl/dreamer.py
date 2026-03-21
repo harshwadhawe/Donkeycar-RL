@@ -1,20 +1,15 @@
 """
 Dreamer v3: Model-Based Reinforcement Learning for DonkeyCar.
 
-Implements Dreamer v3 (arXiv:2301.04104) with key upgrades over v1:
-- Categorical RSSM (discrete latent state instead of Gaussian)
-- Symlog predictions (auto-scaling for rewards and values)
-- LayerNorm + SiLU throughout (replaces ReLU/ELU)
-- KL balancing with free nats (representation + dynamics losses)
-- Percentile-based return normalization (replaces manual reward scaling)
-- Slow EMA critic (replaces hard target updates)
-
-Architecture (sized for DonkeyCar):
-- Belief (deterministic): 256D GRU hidden state
-- State (stochastic): 16 classes x 16 categories = 256D one-hot
-- Visual embedding: 512D from CNN
-- Hidden layers: 256D in all MLPs
-- Planning horizon: 15 steps in imagination
+Implements Dreamer v3 (arXiv:2301.04104):
+- Categorical RSSM (discrete latent state)
+- Twohot discrete regression for reward and value heads
+- Symlog predictions with zero-initialized output weights
+- LayerNorm + SiLU throughout
+- KL balancing with free nats (per-class)
+- Percentile-based return normalization
+- Slow EMA critic with value regularizer
+- Dynamics-based actor gradients (continuous actions)
 """
 
 import torch
@@ -24,6 +19,13 @@ from torch.distributions import Normal, OneHotCategorical
 import numpy as np
 
 from . import config as cfg
+
+
+# ─── Constants ───────────────────────────────────────────
+
+NUM_BINS = 255
+TWOHOT_LOW = -20.0
+TWOHOT_HIGH = 20.0
 
 
 # ─── Symlog Transform ─────────────────────────────────────
@@ -36,6 +38,59 @@ def symlog(x):
 def symexp(x):
     """Inverse of symlog: sign(x) * (exp(|x|) - 1)."""
     return torch.sign(x) * (torch.exp(torch.abs(x)) - 1)
+
+
+# ─── Twohot Discrete Regression (Dreamer v3) ────────────
+
+def twohot_encode(target, bins):
+    """Encode scalar targets into soft two-hot distributions over bins.
+
+    Args:
+        target: (...) scalar values in symlog space
+        bins:   (num_bins,) bin centers
+    Returns:
+        (..., num_bins) two-hot probability vectors
+    """
+    target = target.clamp(bins[0], bins[-1])
+    below = torch.bucketize(target, bins) - 1
+    below = below.clamp(0, len(bins) - 2)
+    above = below + 1
+
+    weight_above = (target - bins[below]) / (bins[above] - bins[below] + 1e-8)
+    weight_below = 1.0 - weight_above
+
+    dist = torch.zeros(*target.shape, len(bins), device=target.device)
+    dist.scatter_(-1, below.unsqueeze(-1), weight_below.unsqueeze(-1))
+    dist.scatter_(-1, above.unsqueeze(-1), weight_above.unsqueeze(-1))
+    return dist
+
+
+def twohot_decode(logits, bins):
+    """Decode logits to scalar values via softmax-weighted bin sum.
+
+    Args:
+        logits: (..., num_bins)
+        bins:   (num_bins,)
+    Returns:
+        (...) scalar values in symlog space
+    """
+    probs = F.softmax(logits, dim=-1)
+    return (probs * bins).sum(dim=-1)
+
+
+def twohot_loss(logits, target, bins):
+    """Cross-entropy between predicted logits and two-hot encoded target.
+
+    Args:
+        logits: (..., num_bins)
+        target: (...) scalar values in symlog space
+        bins:   (num_bins,)
+    Returns:
+        (...) per-element loss
+    """
+    target_dist = twohot_encode(target, bins)
+    log_probs = F.log_softmax(logits, dim=-1)
+    return -(target_dist * log_probs).sum(dim=-1)
 
 
 # ─── MLP Block ────────────────────────────────────────────
@@ -106,7 +161,6 @@ class VisualDecoder(nn.Module):
     def __init__(self, feature_size, out_channels=1):
         super().__init__()
         self.target_size = cfg.IMAGE_SIZE
-        # Start from 4x4 spatial, upsample with deconvs to 64x64
         self.fc = nn.Sequential(
             nn.Linear(feature_size, 256 * 4 * 4),
             nn.LayerNorm(256 * 4 * 4),
@@ -124,7 +178,6 @@ class VisualDecoder(nn.Module):
         h = self.fc(features)
         h = h.view(-1, 256, 4, 4)
         h = self.deconv(h)
-        # Handle non-power-of-2 target sizes (e.g., 40x40)
         if h.shape[-1] != self.target_size:
             h = F.interpolate(h, size=(self.target_size, self.target_size),
                               mode='bilinear', align_corners=False)
@@ -140,9 +193,6 @@ class CategoricalRSSM(nn.Module):
     Deterministic path: h_t = GRU(h_{t-1}, [s_{t-1}, a_{t-1}])
     Prior:     p(s_t | h_t)          = Cat(logits_prior)
     Posterior: q(s_t | h_t, o_t)     = Cat(logits_post)
-
-    State s_t is represented as num_classes independent categorical distributions
-    with num_categories each, flattened as one-hot: (num_classes * num_categories,).
     """
 
     def __init__(self, num_classes=16, num_categories=16, action_size=2,
@@ -155,7 +205,6 @@ class CategoricalRSSM(nn.Module):
         self.belief_size = belief_size
         self.unimix = unimix
 
-        # Embed (state, action) for GRU input
         self.fc_embed = nn.Sequential(
             nn.Linear(self.state_size + action_size, belief_size),
             nn.LayerNorm(belief_size),
@@ -163,7 +212,6 @@ class CategoricalRSSM(nn.Module):
         )
         self.rnn = nn.GRUCell(belief_size, belief_size)
 
-        # Prior: belief -> categorical logits
         self.fc_prior = nn.Sequential(
             nn.Linear(belief_size, hidden_size),
             nn.LayerNorm(hidden_size),
@@ -171,7 +219,6 @@ class CategoricalRSSM(nn.Module):
             nn.Linear(hidden_size, num_classes * num_categories),
         )
 
-        # Posterior: (belief, observation embedding) -> categorical logits
         self.fc_posterior = nn.Sequential(
             nn.Linear(belief_size + embedding_size, hidden_size),
             nn.LayerNorm(hidden_size),
@@ -180,22 +227,6 @@ class CategoricalRSSM(nn.Module):
         )
 
     def forward(self, prev_state, actions, prev_belief, observations=None):
-        """
-        Run RSSM over a sequence.
-
-        Args:
-            prev_state:   (B, state_size) flattened one-hot
-            actions:      (T, B, action_size)
-            prev_belief:  (B, belief_size)
-            observations: (T, B, embedding_size) or None for imagination
-
-        Returns dict with:
-            beliefs:           (T, B, belief_size)
-            prior_logits:      (T, B, num_classes, num_categories)
-            prior_states:      (T, B, state_size)
-            posterior_logits:   (T, B, num_classes, num_categories)  [if observations]
-            posterior_states:   (T, B, state_size)                   [if observations]
-        """
         T = actions.shape[0]
         beliefs = []
         prior_logits_all, prior_states_all = [], []
@@ -205,11 +236,9 @@ class CategoricalRSSM(nn.Module):
         state = prev_state
 
         for t in range(T):
-            # Deterministic transition
             x = self.fc_embed(torch.cat([state, actions[t]], dim=-1))
             belief = self.rnn(x, belief)
 
-            # Prior
             prior_logits = self.fc_prior(belief).view(
                 -1, self.num_classes, self.num_categories
             )
@@ -217,7 +246,6 @@ class CategoricalRSSM(nn.Module):
             prior_state = prior_state_oh.flatten(start_dim=1)
 
             if observations is not None:
-                # Posterior
                 post_input = torch.cat([belief, observations[t]], dim=-1)
                 post_logits = self.fc_posterior(post_input).view(
                     -1, self.num_classes, self.num_categories
@@ -251,11 +279,9 @@ class CategoricalRSSM(nn.Module):
             probs = (1 - self.unimix) * probs + self.unimix * uniform
             logits = torch.log(probs + 1e-8)
 
-        # Actual categorical sample (NOT argmax — argmax kills stochasticity)
         probs = F.softmax(logits, dim=-1)
         dist = OneHotCategorical(probs=probs)
-        sample = dist.sample()  # hard one-hot sample
-        # Straight-through gradient: forward uses sample, backward uses probs
+        sample = dist.sample()
         return sample + probs - probs.detach()
 
     def imagine_step(self, state, action, belief):
@@ -272,14 +298,17 @@ class CategoricalRSSM(nn.Module):
 # ─── Reward, Continue, and Value Models ────────────────────
 
 class RewardModel(nn.Module):
-    """Predicts symlog(reward) from features."""
+    """Predicts reward as twohot distribution over symlog bins."""
 
     def __init__(self, feature_size, hidden_size=256, num_layers=2):
         super().__init__()
-        self.mlp = DreamerMLP(feature_size, 1, hidden_size, num_layers)
+        self.mlp = DreamerMLP(feature_size, NUM_BINS, hidden_size, num_layers)
+        # Zero-init output weights (Dreamer v3 paper §3.1)
+        self.mlp.net[-1].weight.data.zero_()
+        self.mlp.net[-1].bias.data.zero_()
 
     def forward(self, features):
-        return self.mlp(features)
+        return self.mlp(features)  # (*, NUM_BINS) logits
 
 
 class ContinueModel(nn.Module):
@@ -294,14 +323,17 @@ class ContinueModel(nn.Module):
 
 
 class ValueModel(nn.Module):
-    """Predicts symlog(value) from features."""
+    """Predicts value as twohot distribution over symlog bins."""
 
     def __init__(self, feature_size, hidden_size=256, num_layers=3):
         super().__init__()
-        self.mlp = DreamerMLP(feature_size, 1, hidden_size, num_layers)
+        self.mlp = DreamerMLP(feature_size, NUM_BINS, hidden_size, num_layers)
+        # Zero-init output weights (Dreamer v3 paper §3.1)
+        self.mlp.net[-1].weight.data.zero_()
+        self.mlp.net[-1].bias.data.zero_()
 
     def forward(self, features):
-        return self.mlp(features)
+        return self.mlp(features)  # (*, NUM_BINS) logits
 
 
 # ─── Actor Model ──────────────────────────────────────────
@@ -322,14 +354,13 @@ class ActorModel(nn.Module):
         self.fix_speed = fix_speed
         self.throttle_base = throttle_base
 
-        # When fix_speed=True, only learn steering (1D action)
         self._learned_dims = 1 if fix_speed else action_size
         self.mlp = DreamerMLP(feature_size, 2 * self._learned_dims, hidden_size, num_layers)
 
     def forward(self, features):
         out = self.mlp(features)
         mean, std_raw = out.chunk(2, dim=-1)
-        mean = 5.0 * torch.tanh(mean / 5.0)  # soft clamp mean
+        mean = 5.0 * torch.tanh(mean / 5.0)
         std = F.softplus(std_raw + self.raw_init_std) + self.min_std
         return mean, std
 
@@ -346,14 +377,13 @@ class ActorModel(nn.Module):
         action = torch.tanh(action)
 
         if self.fix_speed:
-            # action is (B, 1) steering only — append fixed throttle
             throttle = torch.full_like(action[..., :1], self.throttle_base)
             action = torch.cat([action, throttle], dim=-1)
         return action
 
     def log_prob(self, features, action):
         if self.fix_speed:
-            action = action[..., :1]  # only steering is learned
+            action = action[..., :1]
         dist = self.get_dist(features)
         raw_action = torch.atanh(action.clamp(-0.999, 0.999))
         log_p = dist.log_prob(raw_action)
@@ -374,9 +404,8 @@ def compute_lambda_returns(rewards, values, continues, gamma, disclam):
     Args:
         rewards:   (H, B, 1)
         values:    (H+1, B, 1)
-        continues: (H, B, 1) continuation probability
-        gamma:     discount factor
-        disclam:   lambda for GAE
+        continues: (H, B, 1)
+        gamma, disclam: scalars
     Returns:
         returns:   (H, B, 1)
     """
@@ -396,11 +425,8 @@ def compute_lambda_returns(rewards, values, continues, gamma, disclam):
 
 class Dreamer:
     """
-    Complete Dreamer v3 agent.
-
-    Manages world model (categorical RSSM + encoder + decoder + reward/continue),
-    actor-critic in latent imagination with symlog predictions,
-    percentile-based return normalization, and slow EMA critic.
+    Complete Dreamer v3 agent with twohot regression, slow value
+    regularizer, and dynamics-based actor gradients.
     """
 
     def __init__(self, device='cpu'):
@@ -410,10 +436,15 @@ class Dreamer:
         bs = cfg.DREAMER_BELIEF_SIZE
         nc = cfg.DREAMER_NUM_CLASSES
         ncat = cfg.DREAMER_NUM_CATEGORIES
-        ss = nc * ncat  # flat state size
+        ss = nc * ncat
         hs = cfg.DREAMER_HIDDEN_SIZE
         es = cfg.DREAMER_EMBEDDING_SIZE
-        feature_size = bs + ss  # belief + state concatenated
+        feature_size = bs + ss
+
+        # Twohot bins (registered once, moved to device)
+        self._twohot_bins = torch.linspace(
+            TWOHOT_LOW, TWOHOT_HIGH, NUM_BINS, device=device
+        )
 
         # World model
         self.encoder = VisualEncoder(channels, es).to(device)
@@ -467,10 +498,9 @@ class Dreamer:
         with torch.no_grad():
             observation = observation.to(self.device)
             action = action.to(self.device)
-            embedding = self.encoder(observation)  # (1, embedding_size)
-
-            action_seq = action.unsqueeze(0)       # (1, 1, 2)
-            embedding_seq = embedding.unsqueeze(0)  # (1, 1, embedding_size)
+            embedding = self.encoder(observation)
+            action_seq = action.unsqueeze(0)
+            embedding_seq = embedding.unsqueeze(0)
 
             result = self.rssm(
                 self.state, action_seq, self.belief, embedding_seq
@@ -483,10 +513,7 @@ class Dreamer:
         self.infer_state(observation, action)
         with torch.no_grad():
             features = torch.cat([self.belief, self.state], dim=-1)
-            action = self.actor.sample_action(
-                features, explore=explore,
-                expl_amount=cfg.DREAMER_EXPL_AMOUNT
-            )
+            action = self.actor.sample_action(features, explore=explore)
         return action.cpu().numpy().flatten()
 
     def update(self, buffer, gradient_steps=None):
@@ -494,9 +521,10 @@ class Dreamer:
         if gradient_steps is None:
             gradient_steps = cfg.DREAMER_GRADIENT_STEPS
 
-        # Only need enough data for one chunk (sampling is with replacement)
         if buffer.total_steps < cfg.DREAMER_CHUNK_SIZE * 2:
             return {}
+
+        bins = self._twohot_bins
 
         totals = {k: 0.0 for k in [
             'world_loss', 'obs_loss', 'reward_loss', 'kl_loss',
@@ -530,31 +558,32 @@ class Dreamer:
             recon = bottle(self.decoder, [features])
             obs_loss = F.mse_loss(recon, obs, reduction='none').sum(dim=(2, 3, 4)).mean()
 
-            # Reward loss (symlog)
-            pred_rewards = bottle(self.reward_model, [features])
-            reward_loss = 0.5 * (
-                pred_rewards.squeeze(-1) - symlog(rewards)
-            ).pow(2).mean()
+            # Reward loss — twohot cross-entropy in symlog space
+            pred_reward_logits = bottle(self.reward_model, [features])  # (T, B, NUM_BINS)
+            reward_targets = symlog(rewards)  # (T, B)
+            reward_loss = twohot_loss(
+                pred_reward_logits.reshape(-1, NUM_BINS),
+                reward_targets.reshape(-1),
+                bins
+            ).mean()
 
-            # KL balancing (Dreamer v3)
+            # KL balancing (Dreamer v3) — free nats applied per class
             nc = cfg.DREAMER_NUM_CLASSES
-            ncat = cfg.DREAMER_NUM_CATEGORIES
 
-            # Representation loss: KL(posterior || sg(prior)) — trains encoder
             post_dist = OneHotCategorical(logits=posterior_logits)
             prior_dist_sg = OneHotCategorical(logits=prior_logits.detach())
             kl_rep = torch.distributions.kl_divergence(
                 post_dist, prior_dist_sg
-            ).sum(dim=-1)  # (T, B)
-            kl_rep = torch.clamp(kl_rep, min=cfg.DREAMER_KL_FREE_NATS)
+            )  # (T, B, num_classes)
+            # Free nats per class, then sum
+            kl_rep = torch.clamp(kl_rep, min=cfg.DREAMER_KL_FREE_NATS / nc).sum(dim=-1)
 
-            # Dynamics loss: KL(sg(posterior) || prior) — trains transition
             post_dist_sg = OneHotCategorical(logits=posterior_logits.detach())
             prior_dist = OneHotCategorical(logits=prior_logits)
             kl_dyn = torch.distributions.kl_divergence(
                 post_dist_sg, prior_dist
-            ).sum(dim=-1)  # (T, B)
-            kl_dyn = torch.clamp(kl_dyn, min=cfg.DREAMER_KL_FREE_NATS)
+            )  # (T, B, num_classes)
+            kl_dyn = torch.clamp(kl_dyn, min=cfg.DREAMER_KL_FREE_NATS / nc).sum(dim=-1)
 
             kl_loss = (
                 cfg.DREAMER_KL_REP_WEIGHT * kl_rep.mean() +
@@ -583,19 +612,17 @@ class Dreamer:
             for p in self.value_model.parameters():
                 p.requires_grad_(False)
 
-            # Imagine from ALL timesteps (not just the last)
-            # Flatten (T, B) -> (T*B,) as starting states
-            flat_belief = beliefs.detach().reshape(-1, bs)       # (T*B, bs)
-            flat_state = posterior_states.detach().reshape(-1, ss)  # (T*B, ss)
+            flat_belief = beliefs.detach().reshape(-1, bs)
+            flat_state = posterior_states.detach().reshape(-1, ss)
 
             imag_beliefs = [flat_belief]
             imag_states = [flat_state]
 
             for _ in range(cfg.DREAMER_PLANNING_HORIZON):
-                imag_features = torch.cat(
+                imag_feat = torch.cat(
                     [imag_beliefs[-1], imag_states[-1]], dim=-1
                 )
-                imag_action = self.actor.sample_action(imag_features, explore=False)
+                imag_action = self.actor.sample_action(imag_feat, explore=False)
                 new_belief, new_state = self.rssm.imagine_step(
                     imag_states[-1], imag_action, imag_beliefs[-1]
                 )
@@ -606,16 +633,20 @@ class Dreamer:
             imag_states = torch.stack(imag_states)       # (H+1, T*B, ss)
             imag_features = torch.cat([imag_beliefs, imag_states], dim=-1)
 
-            # Predict rewards, values, continues in imagination
-            imag_rewards_symlog = bottle(
+            # Predict rewards and values via twohot decoding
+            imag_reward_logits = bottle(
                 self.reward_model, [imag_features[:-1]]
-            )  # (H, B, 1)
-            imag_rewards = symexp(imag_rewards_symlog)
+            )  # (H, T*B, NUM_BINS)
+            imag_rewards = symexp(
+                twohot_decode(imag_reward_logits, bins)
+            ).unsqueeze(-1)  # (H, T*B, 1)
 
-            imag_values_symlog = bottle(
+            imag_value_logits = bottle(
                 self.value_target, [imag_features]
-            )  # (H+1, B, 1)
-            imag_values = symexp(imag_values_symlog)
+            )  # (H+1, T*B, NUM_BINS)
+            imag_values = symexp(
+                twohot_decode(imag_value_logits, bins)
+            ).unsqueeze(-1)  # (H+1, T*B, 1)
 
             if self.continue_model is not None:
                 imag_cont = bottle(
@@ -628,22 +659,35 @@ class Dreamer:
             returns = compute_lambda_returns(
                 imag_rewards, imag_values, imag_cont,
                 cfg.DREAMER_GAMMA, cfg.DREAMER_DISCLAM
-            )  # (H, B, 1)
+            )  # (H, T*B, 1)
 
-            # Percentile-based return normalization (Dreamer v3)
+            # Compute advantages (return - value baseline)
+            # baseline is detached; returns keeps gradients through actor
             with torch.no_grad():
-                flat_returns = returns.flatten()
-                low = torch.quantile(flat_returns, cfg.DREAMER_RETURN_NORM_LOW / 100.0)
-                high = torch.quantile(flat_returns, cfg.DREAMER_RETURN_NORM_HIGH / 100.0)
-                scale = torch.clamp(high - low, min=1.0)
-            normalized_returns = (returns - low) / scale
+                baseline_logits = bottle(
+                    self.value_model, [imag_features[:-1]]
+                )
+                baseline = symexp(
+                    twohot_decode(baseline_logits, bins)
+                ).unsqueeze(-1)  # (H, T*B, 1)
 
-            # Actor loss: maximize normalized returns + entropy bonus
+            advantages = returns - baseline  # returns has grads, baseline detached
+
+            # Percentile normalization (compute scale from detached values)
+            with torch.no_grad():
+                flat_adv = advantages.flatten()
+                low = torch.quantile(flat_adv, cfg.DREAMER_RETURN_NORM_LOW / 100.0)
+                high = torch.quantile(flat_adv, cfg.DREAMER_RETURN_NORM_HIGH / 100.0)
+                scale = torch.clamp(high - low, min=1.0)
+            # Apply scale but keep gradient through returns
+            normalized_adv = (advantages - low.detach()) / scale.detach()
+
+            # Actor loss: dynamics-based gradient flows through returns → actor
             actor_entropy = bottle(
                 self.actor.entropy, [imag_features[:-1]]
-            )  # (H, B, 1)
+            )  # (H, T*B, 1)
             actor_loss = -(
-                normalized_returns + cfg.DREAMER_ACTOR_ENTROPY * actor_entropy
+                normalized_adv + cfg.DREAMER_ACTOR_ENTROPY * actor_entropy
             ).mean()
 
             self.actor_optimizer.zero_grad()
@@ -658,14 +702,30 @@ class Dreamer:
                 p.requires_grad_(True)
 
             # ── Value Model ──────────────────────────────
-            with torch.no_grad():
-                value_target = symlog(returns).detach()
-
-            value_pred = bottle(
+            # Twohot cross-entropy loss
+            value_logits = bottle(
                 self.value_model,
                 [imag_features[:-1].detach()]
-            )
-            value_loss = 0.5 * (value_pred - value_target).pow(2).mean()
+            )  # (H, T*B, NUM_BINS)
+            value_targets = symlog(returns.squeeze(-1)).detach()  # (H, T*B)
+            value_loss = twohot_loss(
+                value_logits.reshape(-1, NUM_BINS),
+                value_targets.reshape(-1),
+                bins
+            ).mean()
+
+            # Slow value regularizer: cross-entropy toward EMA target
+            with torch.no_grad():
+                slow_logits = bottle(
+                    self.value_target,
+                    [imag_features[:-1].detach()]
+                )
+                slow_probs = F.softmax(slow_logits, dim=-1)
+            value_reg = -(
+                slow_probs.reshape(-1, NUM_BINS) *
+                F.log_softmax(value_logits.reshape(-1, NUM_BINS), dim=-1)
+            ).sum(dim=-1).mean()
+            value_loss += value_reg
 
             self.value_optimizer.zero_grad()
             value_loss.backward()
@@ -674,7 +734,7 @@ class Dreamer:
             )
             self.value_optimizer.step()
 
-            # Slow EMA target update (every step, small fraction)
+            # Slow EMA target update
             tau = cfg.DREAMER_SLOW_TARGET_FRACTION
             for p, tp in zip(self.value_model.parameters(),
                              self.value_target.parameters()):
@@ -712,7 +772,7 @@ class Dreamer:
             'actor': self.actor.state_dict(),
             'value_model': self.value_model.state_dict(),
             'value_target': self.value_target.state_dict(),
-            'version': 'dreamer_v3',
+            'version': 'dreamer_v3_twohot',
         }
         if self.continue_model:
             state['continue_model'] = self.continue_model.state_dict()

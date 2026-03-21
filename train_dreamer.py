@@ -471,9 +471,16 @@ def train(args):
 
             # Train after seed episodes
             if episode >= cfg.DREAMER_SEED_EPISODES:
-                logger.info(f'Training for {cfg.DREAMER_GRADIENT_STEPS} steps...')
+                # Dynamic gradient steps: train_ratio * episode_steps / (batch * chunk)
+                gradient_steps = max(1, int(
+                    episode_steps * cfg.DREAMER_TRAIN_RATIO /
+                    (cfg.DREAMER_BATCH_SIZE * cfg.DREAMER_CHUNK_SIZE)
+                ))
+                logger.info(f'Training for {gradient_steps} steps '
+                            f'(episode_steps={episode_steps}, '
+                            f'ratio={cfg.DREAMER_TRAIN_RATIO})...')
                 t0 = time.time()
-                metrics = dreamer.update(buffer)
+                metrics = dreamer.update(buffer, gradient_steps=gradient_steps)
                 dt = time.time() - t0
 
                 if metrics:
@@ -515,7 +522,7 @@ def train(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Dreamer v3 training')
-    parser.add_argument('--episodes', type=int, default=100,
+    parser.add_argument('--episodes', type=int, default=500,
                         help='Number of episodes to train')
     parser.add_argument('--model', type=str, default='models/dreamer_v3.pth',
                         help='Model save path')
