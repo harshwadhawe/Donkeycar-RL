@@ -340,8 +340,8 @@ class ValueModel(nn.Module):
 
 class ActorModel(nn.Module):
     """
-    Policy network: (belief, state) -> Normal distribution over actions.
-    Uses tanh squashing. LayerNorm + SiLU hidden layers.
+    Policy network: (belief, state) -> clamped Normal distribution over actions.
+    Uses hard clamp [-1, 1] instead of tanh to avoid gradient vanishing at edges.
     """
 
     def __init__(self, feature_size, action_size=2, hidden_size=256,
@@ -360,7 +360,7 @@ class ActorModel(nn.Module):
     def forward(self, features):
         out = self.mlp(features)
         mean, std_raw = out.chunk(2, dim=-1)
-        mean = 5.0 * torch.tanh(mean / 5.0)
+        mean = 5.0 * torch.tanh(mean / 5.0)  # soft-clamp mean for stability
         std = F.softplus(std_raw + self.raw_init_std) + self.min_std
         return mean, std
 
@@ -369,12 +369,12 @@ class ActorModel(nn.Module):
         return Normal(mean, std)
 
     def sample_action(self, features, explore=False, **kwargs):
-        dist = self.get_dist(features)
+        mean, std = self.forward(features)
         if explore:
-            action = dist.rsample()
+            action = mean + torch.randn_like(mean) * std
         else:
-            action = dist.mean
-        action = torch.tanh(action)
+            action = mean
+        action = torch.clamp(action, -1.0, 1.0)
 
         if self.fix_speed:
             throttle = torch.full_like(action[..., :1], self.throttle_base)
@@ -385,9 +385,7 @@ class ActorModel(nn.Module):
         if self.fix_speed:
             action = action[..., :1]
         dist = self.get_dist(features)
-        raw_action = torch.atanh(action.clamp(-0.999, 0.999))
-        log_p = dist.log_prob(raw_action)
-        log_p = log_p - torch.log(1 - action.pow(2) + 1e-6)
+        log_p = dist.log_prob(action)
         return log_p.sum(dim=-1, keepdim=True)
 
     def entropy(self, features):
@@ -519,8 +517,10 @@ class Dreamer:
                 action = torch.clamp(action + noise, -1.0, 1.0)
         return action.cpu().numpy().flatten()
 
-    def update(self, buffer, gradient_steps=None):
-        """Train Dreamer v3 on replay buffer data."""
+    def update(self, buffer, gradient_steps=None, world_only=False):
+        """Train Dreamer v3 on replay buffer data.
+        If world_only=True, only train the world model (skip actor/value).
+        """
         if gradient_steps is None:
             gradient_steps = cfg.DREAMER_GRADIENT_STEPS
 
@@ -609,6 +609,15 @@ class Dreamer:
             nn.utils.clip_grad_norm_(self._world_params(), cfg.DREAMER_GRAD_CLIP)
             self.world_optimizer.step()
 
+            if world_only:
+                # World-model warmup: skip actor and value training
+                totals['world_loss'] += world_loss.item()
+                totals['obs_loss'] += obs_loss.item()
+                totals['reward_loss'] += reward_loss.item()
+                totals['kl_loss'] += kl_loss.item()
+                self._gradient_step_count += 1
+                continue
+
             # ── Actor (Latent Imagination) ───────────────
             for p in self._world_params():
                 p.requires_grad_(False)
@@ -695,7 +704,7 @@ class Dreamer:
 
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
-            nn.utils.clip_grad_norm_(self.actor.parameters(), cfg.DREAMER_GRAD_CLIP)
+            nn.utils.clip_grad_norm_(self.actor.parameters(), 10.0)  # tighter than world model
             self.actor_optimizer.step()
 
             # Unfreeze

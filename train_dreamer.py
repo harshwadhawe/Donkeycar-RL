@@ -394,7 +394,12 @@ def train(args):
                 action_tensor = torch.from_numpy(last_action).unsqueeze(0)
 
                 if is_seed:
-                    steer = np.random.uniform(-0.5, 0.5)
+                    # P-controller with noise: drives the track so world model
+                    # sees actual turns, not just the first 3m before crashing
+                    seed_cte = float(info.get("cte", 0.0))
+                    steer = np.clip(-0.7 * seed_cte, -1.0, 1.0)
+                    steer += np.random.normal(0, 0.15)
+                    steer = float(np.clip(steer, -1.0, 1.0))
                     action = np.array([steer, cfg.DREAMER_THROTTLE_BASE],
                                       dtype=np.float32)
                 else:
@@ -459,6 +464,26 @@ def train(args):
                 writer.add_scalar('episode/avg_abs_cte', avg_cte, episode)
                 writer.add_scalar('episode/max_displacement',
                                   max_displacement, episode)
+
+            # World model warmup: after seed episodes collected, train WM
+            # for 100 steps before actor ever gets a gradient
+            if episode == cfg.DREAMER_SEED_EPISODES:
+                warmup_steps = 100
+                logger.info(f'World model warmup: {warmup_steps} steps '
+                            f'(buffer={buffer.total_steps})...')
+                t0_warmup = time.time()
+                warmup_metrics = dreamer.update(
+                    buffer, gradient_steps=warmup_steps, world_only=True
+                )
+                dt_warmup = time.time() - t0_warmup
+                if warmup_metrics:
+                    logger.info(
+                        f'Warmup done in {dt_warmup:.1f}s | '
+                        f'world={warmup_metrics.get("world_loss", 0):.4f} '
+                        f'obs={warmup_metrics.get("obs_loss", 0):.4f} '
+                        f'rew={warmup_metrics.get("reward_loss", 0):.4f} '
+                        f'kl={warmup_metrics.get("kl_loss", 0):.4f}'
+                    )
 
             # Train after seed episodes
             if episode >= cfg.DREAMER_SEED_EPISODES:

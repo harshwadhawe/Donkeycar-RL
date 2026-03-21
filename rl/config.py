@@ -56,7 +56,7 @@ VAE_L2_REG = True
 # ─── Dreamer v3 ──────────────────────────────────────────
 # Based on: Mastering Diverse Domains through World Models (arXiv:2301.04104)
 
-DREAMER_SEED_EPISODES = 10      # random episodes to seed the buffer
+DREAMER_SEED_EPISODES = 20      # P-controller episodes to seed buffer with full-track data
 DREAMER_GRADIENT_STEPS = 50     # fallback if train_ratio can't be computed
 DREAMER_TRAIN_RATIO = 512       # paper default for DMC continuous control
 
@@ -71,7 +71,7 @@ DREAMER_UNIMIX = 0.01           # uniform noise mixed into categoricals
 
 # World model training
 DREAMER_WORLD_LR = 1e-4
-DREAMER_ACTOR_LR = 8e-5
+DREAMER_ACTOR_LR = 3e-5
 DREAMER_VALUE_LR = 8e-5
 DREAMER_ADAM_EPS = 1e-8
 DREAMER_BATCH_SIZE = 64
