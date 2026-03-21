@@ -202,6 +202,10 @@ class RewardShapingWrapper(gym.Wrapper):
     CIRCLE_MIN_DISPLACEMENT = 3.0  # must move at least this far (meters) per window
     CIRCLE_MAX_CTE = 2.0        # avg |CTE| above this over window = off-track
 
+    # Curriculum: CTE-focused early, blend in speed later
+    CURRICULUM_CTE_PHASE = 80     # episodes where CTE dominates
+    CURRICULUM_BLEND_PHASE = 120  # episodes to fully blend in speed
+
     def __init__(self, env, max_episode_steps=None):
         super().__init__(env)
         self.episode_step = 0
@@ -209,10 +213,15 @@ class RewardShapingWrapper(gym.Wrapper):
         self.last_steering = 0.0
         self.stuck_count = 0
         self.stuck_threshold = 10
+        self._episode_num = 0  # set externally via set_episode()
         # Circling detection state
         self._start_pos = None
         self._window_pos = None  # position at start of current check window
         self._window_ctes = []   # CTE values in current window
+
+    def set_episode(self, episode_num):
+        """Called by training loop to update curriculum phase."""
+        self._episode_num = episode_num
 
     def reset(self, **kwargs):
         self.episode_step = 0
@@ -233,19 +242,31 @@ class RewardShapingWrapper(gym.Wrapper):
         steering = float(np.asarray(action)[0]) if hasattr(action, '__len__') else 0.0
         cur_pos = info.get("pos", None)
 
-        # Forward velocity reward (circles have near-zero forward_vel)
-        speed_reward = 1.0 + max(forward_vel, 0.0)
+        # ── Curriculum: blend from CTE-only to CTE+speed ──
+        # alpha=0 during CTE phase, ramps to 1 during blend phase
+        ep = self._episode_num
+        if ep < self.CURRICULUM_CTE_PHASE:
+            alpha = 0.0
+        elif ep < self.CURRICULUM_BLEND_PHASE:
+            alpha = (ep - self.CURRICULUM_CTE_PHASE) / (
+                self.CURRICULUM_BLEND_PHASE - self.CURRICULUM_CTE_PHASE)
+        else:
+            alpha = 1.0
 
-        # CTE bell curve (real CTE from sim with extendedTelemetry)
-        cte_reward = 2.0 * np.exp(-(cte / 1.0) ** 2)
+        # CTE bell curve — big positive reward for staying centered
+        # sigma=1.0: at cte=0 → 5.0, at cte=0.5 → 3.9, at cte=1.0 → 1.8
+        cte_reward = 5.0 * np.exp(-(cte / 1.0) ** 2)
 
-        # Steering smoothness
-        steer_change_penalty = 0.2 * (steering - self.last_steering) ** 2
+        # Speed reward — ramps in with curriculum
+        # Early: small alive bonus so the car prefers moving over standing still
+        # Late: forward velocity adds on top
+        speed_reward = 0.5 + alpha * max(forward_vel, 0.0)
 
-        # Steering magnitude penalty (circles need constant high steering)
-        steer_mag_penalty = 0.3 * steering ** 2
+        # Light penalties — don't overwhelm the positive CTE signal
+        steer_change_penalty = 0.1 * (steering - self.last_steering) ** 2
+        steer_mag_penalty = 0.15 * steering ** 2
 
-        reward = (speed_reward + cte_reward
+        reward = (cte_reward + speed_reward
                   - steer_change_penalty - steer_mag_penalty)
         self.last_steering = steering
 
@@ -413,10 +434,22 @@ def train(args):
     logger.info(f"DREAMER v3 TRAINING")
     logger.info(f"  Episodes: {args.episodes}")
     logger.info(f"  Model: {model_path}")
+    logger.info(f"  Curriculum: CTE-only eps 0-{RewardShapingWrapper.CURRICULUM_CTE_PHASE}, "
+                f"blend to ep {RewardShapingWrapper.CURRICULUM_BLEND_PHASE}, "
+                f"then full speed+CTE")
     logger.info("=" * 60)
 
     try:
         for episode in range(args.episodes):
+            # Update curriculum phase
+            reward_wrapper = env
+            while hasattr(reward_wrapper, 'env'):
+                if isinstance(reward_wrapper, RewardShapingWrapper):
+                    break
+                reward_wrapper = reward_wrapper.env
+            if isinstance(reward_wrapper, RewardShapingWrapper):
+                reward_wrapper.set_episode(episode)
+
             obs, info = env.reset()
             dreamer.reset_belief()
             last_action = np.zeros(2, dtype=np.float32)
