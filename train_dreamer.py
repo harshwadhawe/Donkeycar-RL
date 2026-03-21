@@ -105,13 +105,16 @@ class CTEEstimatorWrapper(gym.Wrapper):
     Must be placed BEFORE DonkeyPreprocessWrapper (needs raw 120x160x3 image).
     """
 
-    def __init__(self, env, bottom_rows=30):
+    def __init__(self, env, bottom_rows=30, smooth_alpha=0.3):
         super().__init__(env)
         self.bottom_rows = bottom_rows
+        self.smooth_alpha = smooth_alpha  # EMA smoothing (lower = smoother)
         self._cte_available = None  # auto-detect on first step
+        self._smooth_cte = 0.0
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
+        self._smooth_cte = 0.0
         return obs, info
 
     def step(self, action):
@@ -126,9 +129,11 @@ class CTEEstimatorWrapper(gym.Wrapper):
         if self._cte_available:
             return obs, reward, terminated, truncated, info
 
-        # Estimate CTE from image
-        estimated_cte = self._estimate_cte(obs)
-        info["cte"] = estimated_cte
+        # Estimate CTE from image with temporal smoothing
+        raw_cte = self._estimate_cte(obs)
+        self._smooth_cte = (self.smooth_alpha * raw_cte +
+                            (1 - self.smooth_alpha) * self._smooth_cte)
+        info["cte"] = self._smooth_cte
         info["cte_source"] = "image"
 
         return obs, reward, terminated, truncated, info
@@ -137,38 +142,47 @@ class CTEEstimatorWrapper(gym.Wrapper):
         """
         Estimate CTE from raw camera image (H, W, 3) uint8.
 
-        Strategy: in the bottom strip, road pixels are darker than grass.
-        Find the road centroid column and compare to image center.
-        Returns CTE in range ~[-3, 3] (scaled to match typical sim CTE range).
+        Uses multiple bottom strips at different heights for robustness.
+        Road is darker than grass — find road centroid vs image center.
         """
         h, w = obs.shape[:2]
-        bottom = obs[h - self.bottom_rows:, :, :]
 
-        # Convert to grayscale
-        gray = cv2.cvtColor(bottom, cv2.COLOR_RGB2GRAY)
+        # Sample 3 strips at different heights for robustness
+        strips = [
+            obs[h - 20:h - 10, :, :],  # near (most reliable)
+            obs[h - 35:h - 25, :, :],  # mid
+            obs[h - 50:h - 40, :, :],  # far
+        ]
+        strip_weights = [0.5, 0.3, 0.2]  # trust near strips more
 
-        # Adaptive threshold: road is darker than the mean
-        mean_val = np.mean(gray)
-        road_mask = gray < mean_val
+        total_offset = 0.0
+        total_weight = 0.0
 
-        # Find column indices of road pixels
-        road_cols = np.where(road_mask)
-        if len(road_cols[1]) < 10:
-            # Not enough road pixels — can't estimate
+        for strip, sw in zip(strips, strip_weights):
+            gray = cv2.cvtColor(strip, cv2.COLOR_RGB2GRAY)
+
+            # Adaptive threshold: road is darker than the mean
+            mean_val = np.mean(gray)
+            road_mask = gray < mean_val
+
+            road_cols = np.where(road_mask)
+            if len(road_cols[1]) < 5:
+                continue
+
+            # Weighted centroid (darker = more confident it's road)
+            weights = mean_val - gray[road_mask]
+            centroid = np.average(road_cols[1], weights=weights)
+            center = w / 2.0
+
+            offset = (centroid - center) / center  # [-1, 1]
+            total_offset += offset * sw
+            total_weight += sw
+
+        if total_weight < 0.1:
             return 0.0
 
-        # Weighted centroid (weight by how dark the pixel is = more confident)
-        weights = mean_val - gray[road_mask]
-        centroid = np.average(road_cols[1], weights=weights)
-        center = w / 2.0
-
-        # Offset: positive = road center is right of image center
-        #        → car is LEFT of track center → positive CTE
-        offset = (centroid - center) / center  # [-1, 1]
-
-        # Scale to match typical CTE range (~[-3, 3])
-        cte = offset * 3.0
-
+        # Scale to CTE range [-3, 3]
+        cte = (total_offset / total_weight) * 3.0
         return float(cte)
 
 
