@@ -768,6 +768,7 @@
 DONKEY_GYM = True
 DONKEY_SIM_PATH = "/Users/harshwadhawe/Downloads/DonkeySimMac/donkey_sim.app/Contents/MacOS/donkey_sim"
 #DONKEY_SIM_PATH = "/home/pistar/harsh/DonkeySimLinux/donkey_sim.x86_64"
+#DONKEY_SIM_PATH = "/home/pistar/DonkeySimLinux/donkey_sim.x86_64"
 
 DONKEY_GYM_ENV_NAME = "donkey-generated-track-v0"
 CONTROLLER_TYPE = "mock"
