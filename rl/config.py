@@ -56,7 +56,7 @@ VAE_L2_REG = True
 # ─── Dreamer v3 ──────────────────────────────────────────
 # Based on: Mastering Diverse Domains through World Models (arXiv:2301.04104)
 
-DREAMER_SEED_EPISODES = 5       # random episodes to seed the buffer
+DREAMER_SEED_EPISODES = 10      # random episodes to seed the buffer
 DREAMER_GRADIENT_STEPS = 50     # fallback if train_ratio can't be computed
 DREAMER_TRAIN_RATIO = 512       # paper default for DMC continuous control
 
@@ -75,7 +75,7 @@ DREAMER_ACTOR_LR = 8e-5
 DREAMER_VALUE_LR = 8e-5
 DREAMER_ADAM_EPS = 1e-8
 DREAMER_BATCH_SIZE = 64
-DREAMER_CHUNK_SIZE = 32         # sequence length for BPTT (paper uses 64, 32 fits 8GB VRAM)
+DREAMER_CHUNK_SIZE = 16         # sequence length for BPTT (reduced: short episodes need short chunks)
 DREAMER_GRAD_CLIP = 100.0
 
 # KL balancing (replaces free nats)
@@ -95,9 +95,9 @@ DREAMER_RETURN_NORM_HIGH = 95   # upper percentile
 
 # Actor
 DREAMER_ACTOR_ENTROPY = 3e-4   # entropy regularization (paper: 3e-4 for continuous)
-DREAMER_ACTOR_MIN_STD = 0.1    # minimum action std
-DREAMER_ACTOR_INIT_STD = 0.5   # initial action std (before training)
-DREAMER_EXPL_AMOUNT = 0.15     # exploration noise std
+DREAMER_ACTOR_MIN_STD = 0.2    # minimum action std (prevents premature collapse)
+DREAMER_ACTOR_INIT_STD = 1.0   # initial action std (before training) — higher = more uniform exploration
+DREAMER_EXPL_AMOUNT = 0.3      # exploration noise std (added to actions during training)
 
 # Slow critic (EMA target, replaces hard target updates)
 DREAMER_SLOW_TARGET_FRACTION = 0.02  # EMA rate per gradient step

@@ -514,6 +514,9 @@ class Dreamer:
         with torch.no_grad():
             features = torch.cat([self.belief, self.state], dim=-1)
             action = self.actor.sample_action(features, explore=explore)
+            if explore and cfg.DREAMER_EXPL_AMOUNT > 0:
+                noise = torch.randn_like(action) * cfg.DREAMER_EXPL_AMOUNT
+                action = torch.clamp(action + noise, -1.0, 1.0)
         return action.cpu().numpy().flatten()
 
     def update(self, buffer, gradient_steps=None):
