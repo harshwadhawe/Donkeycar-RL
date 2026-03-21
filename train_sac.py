@@ -30,7 +30,17 @@ from collections import deque
 import numpy as np
 import torch
 import gymnasium as gym
-import gym_donkeycar  # noqa: F401 (registers gymnasium envs on import)
+import gym_donkeycar  # noqa: F401
+
+# gym_donkeycar may register with old gym or gymnasium depending on version.
+# If envs aren't in gymnasium registry, use shimmy to bridge.
+try:
+    gym.spec('donkey-generated-track-v0')
+    _USE_SHIMMY = False
+except gym.error.NameNotFound:
+    import shimmy
+    gym.register_envs(shimmy)
+    _USE_SHIMMY = True
 
 from stable_baselines3 import SAC
 from stable_baselines3.common.callbacks import CheckpointCallback
@@ -259,7 +269,14 @@ class RewardShapingWrapper(gym.Wrapper):
 def make_env(env_id, conf, vae_path, device):
     """Create a single wrapped donkey env. Returned as a callable for DummyVecEnv."""
     def _init():
-        env = gym.make(env_id, conf=conf)
+        if _USE_SHIMMY:
+            env = gym.make(
+                "GymV21Environment-v0",
+                env_id=env_id,
+                make_kwargs={"conf": conf},
+            )
+        else:
+            env = gym.make(env_id, conf=conf)
         env = DonkeyVAEWrapper(env, vae_path=vae_path, device=device)
         env = SmoothActionWrapper(env, alpha=0.5)
         env = RewardShapingWrapper(env)

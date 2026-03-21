@@ -30,6 +30,15 @@ import gymnasium as gym
 import gym_donkeycar  # noqa: F401
 import cv2
 
+# Bridge old gym_donkeycar versions that register with gym (not gymnasium)
+try:
+    gym.spec('donkey-generated-track-v0')
+    _USE_SHIMMY = False
+except gym.error.NameNotFound:
+    import shimmy
+    gym.register_envs(shimmy)
+    _USE_SHIMMY = True
+
 import donkeycar as dk
 
 from rl.dreamer import Dreamer
@@ -152,7 +161,14 @@ class SmoothActionWrapper(gym.Wrapper):
 # Env Factory
 # ==============================================================================
 def make_env(env_id, conf):
-    env = gym.make(env_id, conf=conf)
+    if _USE_SHIMMY:
+        env = gym.make(
+            "GymV21Environment-v0",
+            env_id=env_id,
+            make_kwargs={"conf": conf},
+        )
+    else:
+        env = gym.make(env_id, conf=conf)
     env = DonkeyPreprocessWrapper(
         env, crop_top=cfg.IMAGE_CROP_TOP,
         target_size=cfg.IMAGE_SIZE, grayscale=not cfg.RGB

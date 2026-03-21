@@ -37,8 +37,7 @@ venv/
 .AppleDouble
 .LSOverride
 
-# Configs with secrets
-myconfig.py
+
 
 # Claude / AI artifacts
 .claude/
