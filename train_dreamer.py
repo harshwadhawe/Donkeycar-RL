@@ -118,15 +118,25 @@ class RewardShapingWrapper(gym.Wrapper):
         return self.env.reset(**kwargs)
 
     def step(self, action):
-        obs, _reward, terminated, truncated, info = self.env.step(action)
+        obs, sim_reward, terminated, truncated, info = self.env.step(action)
         self.episode_step += 1
 
         speed = float(info.get("speed", 0.0))
         cte = float(info.get("cte", 0.0))
         steering = float(np.asarray(action)[0]) if hasattr(action, '__len__') else 0.0
 
-        # CTE bell curve — wider sigma so agent gets gradient off-center
-        cte_reward = 3.0 * np.exp(-(cte / 1.0) ** 2)
+        # Use sim reward as CTE proxy when CTE is not available
+        # The sim internally computes: reward ≈ speed * (1 - |cte|/max_cte)
+        # This gives a natural track-centering signal even if CTE isn't in info
+        sim_reward_f = float(sim_reward)
+
+        if abs(cte) > 1e-6:
+            # CTE is available — use our bell curve
+            cte_reward = 3.0 * np.exp(-(cte / 1.0) ** 2)
+        else:
+            # CTE not available — use sim reward as centering signal
+            # Sim reward is typically ~1.0 when centered, ~0 when off-track
+            cte_reward = 2.0 * max(sim_reward_f, 0.0)
 
         # Speed reward — only forward progress matters
         speed_reward = 0.5 * max(speed, 0.0)
@@ -165,6 +175,7 @@ class RewardShapingWrapper(gym.Wrapper):
         if self.episode_step >= self.max_episode_steps:
             truncated = True
 
+        info['sim_reward'] = sim_reward_f
         return obs, reward, terminated, truncated, info
 
 
@@ -311,7 +322,12 @@ def train(args):
                     # Early on, mostly P-controller (keeps car on track so world
                     # model gets useful data). Gradually shift to full policy.
                     cte = float(info.get("cte", 0.0))
-                    corrective_steer = np.clip(-0.5 * cte, -0.8, 0.8)
+                    if abs(cte) > 1e-6:
+                        corrective_steer = np.clip(-0.5 * cte, -0.8, 0.8)
+                    else:
+                        # CTE not available — use last steering direction with
+                        # small correction toward center (assumes mostly straight)
+                        corrective_steer = 0.0  # no correction possible without CTE
                     # blend: 0→1 over BLEND_EPISODES after seed phase
                     # Slow ramp — world model needs thousands of steps before
                     # the policy can be trusted
@@ -327,8 +343,23 @@ def train(args):
                 next_obs, reward, terminated, truncated, info = env.step(action)
                 done = terminated or truncated
 
-                episode_speeds.append(float(info.get("speed", 0.0)))
-                episode_ctes.append(float(info.get("cte", 0.0)))
+                step_speed = float(info.get("speed", 0.0))
+                step_cte = float(info.get("cte", 0.0))
+                episode_speeds.append(step_speed)
+                episode_ctes.append(step_cte)
+
+                # Diagnostic: log info dict on very first step, then CTE periodically
+                if episode == 0 and episode_steps == 1:
+                    logger.info(f'FIRST STEP INFO KEYS: {sorted(info.keys())}')
+                    logger.info(f'FIRST STEP INFO: cte={info.get("cte", "MISSING")}, '
+                                f'speed={info.get("speed", "MISSING")}, '
+                                f'pos={info.get("pos", "MISSING")}, '
+                                f'hit={info.get("hit", "MISSING")}')
+                if episode < 2 and episode_steps % 200 == 0:
+                    sim_r = float(info.get("sim_reward", 0.0))
+                    logger.info(f'  [ep{episode} step{episode_steps}] raw cte={step_cte:.6f}, '
+                                f'speed={step_speed:.3f}, steer={action[0]:.3f}, '
+                                f'sim_reward={sim_r:.3f}')
 
                 # Store in buffer
                 buffer.add_step(obs, action, reward, done)
