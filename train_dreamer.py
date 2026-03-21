@@ -92,6 +92,87 @@ class DonkeyPreprocessWrapper(gym.ObservationWrapper):
 
 
 # ==============================================================================
+# Image-Based CTE Estimator
+# ==============================================================================
+class CTEEstimatorWrapper(gym.Wrapper):
+    """
+    Estimate cross-track error from camera image when the sim doesn't provide it.
+
+    Looks at the bottom strip of the raw image (road area visible to the car).
+    The road is darker than the grass/shoulder. We find the road centroid and
+    compute its offset from image center → estimated CTE.
+
+    Must be placed BEFORE DonkeyPreprocessWrapper (needs raw 120x160x3 image).
+    """
+
+    def __init__(self, env, bottom_rows=30):
+        super().__init__(env)
+        self.bottom_rows = bottom_rows
+        self._cte_available = None  # auto-detect on first step
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        return obs, info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+
+        sim_cte = float(info.get("cte", 0.0))
+
+        # Auto-detect: if sim provides CTE, don't override
+        if self._cte_available is None and abs(sim_cte) > 1e-6:
+            self._cte_available = True
+
+        if self._cte_available:
+            return obs, reward, terminated, truncated, info
+
+        # Estimate CTE from image
+        estimated_cte = self._estimate_cte(obs)
+        info["cte"] = estimated_cte
+        info["cte_source"] = "image"
+
+        return obs, reward, terminated, truncated, info
+
+    def _estimate_cte(self, obs):
+        """
+        Estimate CTE from raw camera image (H, W, 3) uint8.
+
+        Strategy: in the bottom strip, road pixels are darker than grass.
+        Find the road centroid column and compare to image center.
+        Returns CTE in range ~[-3, 3] (scaled to match typical sim CTE range).
+        """
+        h, w = obs.shape[:2]
+        bottom = obs[h - self.bottom_rows:, :, :]
+
+        # Convert to grayscale
+        gray = cv2.cvtColor(bottom, cv2.COLOR_RGB2GRAY)
+
+        # Adaptive threshold: road is darker than the mean
+        mean_val = np.mean(gray)
+        road_mask = gray < mean_val
+
+        # Find column indices of road pixels
+        road_cols = np.where(road_mask)
+        if len(road_cols[1]) < 10:
+            # Not enough road pixels — can't estimate
+            return 0.0
+
+        # Weighted centroid (weight by how dark the pixel is = more confident)
+        weights = mean_val - gray[road_mask]
+        centroid = np.average(road_cols[1], weights=weights)
+        center = w / 2.0
+
+        # Offset: positive = road center is right of image center
+        #        → car is LEFT of track center → positive CTE
+        offset = (centroid - center) / center  # [-1, 1]
+
+        # Scale to match typical CTE range (~[-3, 3])
+        cte = offset * 3.0
+
+        return float(cte)
+
+
+# ==============================================================================
 # Reward Shaping Wrapper
 # ==============================================================================
 class RewardShapingWrapper(gym.Wrapper):
@@ -118,25 +199,15 @@ class RewardShapingWrapper(gym.Wrapper):
         return self.env.reset(**kwargs)
 
     def step(self, action):
-        obs, sim_reward, terminated, truncated, info = self.env.step(action)
+        obs, _sim_reward, terminated, truncated, info = self.env.step(action)
         self.episode_step += 1
 
         speed = float(info.get("speed", 0.0))
-        cte = float(info.get("cte", 0.0))
+        cte = float(info.get("cte", 0.0))  # now estimated by CTEEstimatorWrapper
         steering = float(np.asarray(action)[0]) if hasattr(action, '__len__') else 0.0
 
-        # Use sim reward as CTE proxy when CTE is not available
-        # The sim internally computes: reward ≈ speed * (1 - |cte|/max_cte)
-        # This gives a natural track-centering signal even if CTE isn't in info
-        sim_reward_f = float(sim_reward)
-
-        if abs(cte) > 1e-6:
-            # CTE is available — use our bell curve
-            cte_reward = 3.0 * np.exp(-(cte / 1.0) ** 2)
-        else:
-            # CTE not available — use sim reward as centering signal
-            # Sim reward is typically ~1.0 when centered, ~0 when off-track
-            cte_reward = 2.0 * max(sim_reward_f, 0.0)
+        # CTE bell curve — CTE is now always available (estimated from image if needed)
+        cte_reward = 3.0 * np.exp(-(cte / 1.0) ** 2)
 
         # Speed reward — only forward progress matters
         speed_reward = 0.5 * max(speed, 0.0)
@@ -163,8 +234,8 @@ class RewardShapingWrapper(gym.Wrapper):
         if self.stuck_count >= self.stuck_threshold:
             terminated = True
 
-        # Hard CTE termination — don't trust the sim to enforce max_cte
-        if abs(cte) > 3.0:
+        # Terminate if estimated CTE is extreme (car far off track)
+        if abs(cte) > 2.5:
             terminated = True
 
         # Crash penalty
@@ -175,7 +246,6 @@ class RewardShapingWrapper(gym.Wrapper):
         if self.episode_step >= self.max_episode_steps:
             truncated = True
 
-        info['sim_reward'] = sim_reward_f
         return obs, reward, terminated, truncated, info
 
 
@@ -214,6 +284,8 @@ def make_env(env_id, conf):
         )
     else:
         env = gym.make(env_id, conf=conf)
+    # CTE estimator MUST come before preprocessing (needs raw image)
+    env = CTEEstimatorWrapper(env)
     env = DonkeyPreprocessWrapper(
         env, crop_top=cfg.IMAGE_CROP_TOP,
         target_size=cfg.IMAGE_SIZE, grayscale=not cfg.RGB
@@ -321,13 +393,9 @@ def train(args):
                     # Blend policy with P-controller that steers toward center.
                     # Early on, mostly P-controller (keeps car on track so world
                     # model gets useful data). Gradually shift to full policy.
+                    # CTE is now estimated from camera image by CTEEstimatorWrapper
                     cte = float(info.get("cte", 0.0))
-                    if abs(cte) > 1e-6:
-                        corrective_steer = np.clip(-0.5 * cte, -0.8, 0.8)
-                    else:
-                        # CTE not available — use last steering direction with
-                        # small correction toward center (assumes mostly straight)
-                        corrective_steer = 0.0  # no correction possible without CTE
+                    corrective_steer = np.clip(-0.5 * cte, -0.8, 0.8)
                     # blend: 0→1 over BLEND_EPISODES after seed phase
                     # Slow ramp — world model needs thousands of steps before
                     # the policy can be trusted

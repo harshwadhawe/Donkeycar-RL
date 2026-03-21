@@ -100,21 +100,51 @@ for k, v in sorted(info.items()):
     vstr = f"{v}" if not isinstance(v, np.ndarray) else f"ndarray{v.shape}"
     print(f"    {k}: {vstr}")
 
-# ── 5. Steering test (does CTE change?) ─────────────────
+# ── 5. CTE Estimator test ────────────────────────────────
 print()
 print("=" * 60)
-print("5. STEERING TEST (hard left 20 steps)")
+print("5. IMAGE-BASED CTE ESTIMATOR")
 print("=" * 60)
-for i in range(20):
-    action = np.array([1.0, 0.3], dtype=np.float32)  # hard left
-    obs, reward, terminated, truncated, info = env.step(action)
-    cte = info.get("cte", 0.0)
-    speed = info.get("speed", 0.0)
+from train_dreamer import CTEEstimatorWrapper
+import cv2
+
+# Wrap the raw env with CTE estimator
+env2 = CTEEstimatorWrapper(env)
+obs2, info2 = env2.reset()
+
+print("  Driving straight (10 steps):")
+for i in range(10):
+    action = np.array([0.0, 0.3], dtype=np.float32)
+    obs2, reward, terminated, truncated, info2 = env2.step(action)
+    est_cte = info2.get("cte", "MISSING")
+    source = info2.get("cte_source", "sim")
+    if i % 3 == 0:
+        print(f"    step {i}: est_cte={est_cte:.4f} (source={source})")
+
+print("  Hard LEFT (15 steps):")
+for i in range(15):
+    action = np.array([1.0, 0.3], dtype=np.float32)
+    obs2, reward, terminated, truncated, info2 = env2.step(action)
+    est_cte = info2.get("cte", 0.0)
+    source = info2.get("cte_source", "sim")
     if terminated or truncated:
-        print(f"  step {i}: TERMINATED! reward={reward:.4f}, cte={cte}, speed={speed}")
+        print(f"    step {i}: TERMINATED! est_cte={est_cte:.4f}")
+        obs2, info2 = env2.reset()
         break
-    if i % 5 == 0:
-        print(f"  step {i}: reward={reward:.4f}, cte={cte}, speed={speed}")
+    if i % 3 == 0:
+        print(f"    step {i}: est_cte={est_cte:.4f} (source={source})")
+
+print("  Hard RIGHT (15 steps):")
+for i in range(15):
+    action = np.array([-1.0, 0.3], dtype=np.float32)
+    obs2, reward, terminated, truncated, info2 = env2.step(action)
+    est_cte = info2.get("cte", 0.0)
+    source = info2.get("cte_source", "sim")
+    if terminated or truncated:
+        print(f"    step {i}: TERMINATED! est_cte={est_cte:.4f}")
+        break
+    if i % 3 == 0:
+        print(f"    step {i}: est_cte={est_cte:.4f} (source={source})")
 
 env.close()
 
