@@ -12,10 +12,10 @@ THROTTLE_MAX = 0.6
 MAX_STEERING_DIFF = 0.2  # max steering change per step
 
 # Observation
-IMAGE_SIZE = 40           # resize to 40x40
+IMAGE_SIZE = 64           # resize to 64x64 (more detail for world model)
 IMAGE_CROP_TOP = 40       # crop top 40px from 120x160 raw image
 FRAME_STACK = 1
-RGB = False               # grayscale
+RGB = True                # RGB (4060 can handle it, more info for world model)
 
 # Episode
 MAX_EPISODE_STEPS = 500
@@ -57,15 +57,15 @@ VAE_L2_REG = True
 # Based on: Mastering Diverse Domains through World Models (arXiv:2301.04104)
 
 DREAMER_SEED_EPISODES = 20      # random episodes to seed the buffer
-DREAMER_GRADIENT_STEPS = 30     # world model updates per data collection (keep ~1:1 with new data)
+DREAMER_GRADIENT_STEPS = 50     # world model updates per data collection
 
 # RSSM — categorical latent state
 DREAMER_BELIEF_SIZE = 256       # GRU hidden (deterministic)
 DREAMER_NUM_CLASSES = 16        # number of categorical distributions
 DREAMER_NUM_CATEGORIES = 16     # categories per distribution
 DREAMER_STATE_SIZE = 16 * 16    # flattened one-hot = 256
-DREAMER_HIDDEN_SIZE = 256       # MLP hidden layers
-DREAMER_EMBEDDING_SIZE = 512    # visual encoder output
+DREAMER_HIDDEN_SIZE = 512       # MLP hidden layers
+DREAMER_EMBEDDING_SIZE = 1024   # visual encoder output
 DREAMER_UNIMIX = 0.01           # uniform noise mixed into categoricals
 
 # World model training
@@ -73,7 +73,7 @@ DREAMER_WORLD_LR = 1e-4
 DREAMER_ACTOR_LR = 8e-5
 DREAMER_VALUE_LR = 8e-5
 DREAMER_ADAM_EPS = 1e-8
-DREAMER_BATCH_SIZE = 16
+DREAMER_BATCH_SIZE = 64
 DREAMER_CHUNK_SIZE = 15         # sequence length for BPTT (must be < avg episode length)
 DREAMER_GRAD_CLIP = 100.0
 
@@ -102,7 +102,7 @@ DREAMER_EXPL_AMOUNT = 0.15     # exploration noise std
 DREAMER_SLOW_TARGET_FRACTION = 0.02  # EMA rate per gradient step
 
 # Buffer
-DREAMER_BUFFER_SIZE = 1_000_000
+DREAMER_BUFFER_SIZE = 100_000     # ~4.7GB for RGB 64x64 (was 1M = 46GB OOM)
 
 # Throttle control
 DREAMER_FIX_SPEED = True        # fix throttle so agent only learns steering first

@@ -101,27 +101,34 @@ class VisualEncoder(nn.Module):
 # ─── Visual Decoder ───────────────────────────────────────
 
 class VisualDecoder(nn.Module):
-    """Transposed CNN decoder: features -> CxHxW image."""
+    """Transposed CNN decoder: features -> CxHxW image (any IMAGE_SIZE)."""
 
     def __init__(self, feature_size, out_channels=1):
         super().__init__()
+        self.target_size = cfg.IMAGE_SIZE
+        # Start from 4x4 spatial, upsample with deconvs to 64x64
         self.fc = nn.Sequential(
-            nn.Linear(feature_size, 256),
-            nn.LayerNorm(256),
+            nn.Linear(feature_size, 256 * 4 * 4),
+            nn.LayerNorm(256 * 4 * 4),
             nn.SiLU(),
         )
-        # 256x1x1 -> 3x3 -> 8x8 -> 18x18 -> 40x40
+        # 4x4 -> 8x8 -> 16x16 -> 32x32 -> 64x64
         self.deconv = nn.Sequential(
-            nn.ConvTranspose2d(256, 128, 3, stride=2), nn.SiLU(),
-            nn.ConvTranspose2d(128, 64, 4, stride=2), nn.SiLU(),
-            nn.ConvTranspose2d(64, 32, 4, stride=2), nn.SiLU(),
-            nn.ConvTranspose2d(32, out_channels, 6, stride=2),
+            nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1), nn.SiLU(),
+            nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1), nn.SiLU(),
+            nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1), nn.SiLU(),
+            nn.ConvTranspose2d(32, out_channels, 4, stride=2, padding=1),
         )
 
     def forward(self, features):
         h = self.fc(features)
-        h = h.view(-1, 256, 1, 1)
-        return self.deconv(h)
+        h = h.view(-1, 256, 4, 4)
+        h = self.deconv(h)
+        # Handle non-power-of-2 target sizes (e.g., 40x40)
+        if h.shape[-1] != self.target_size:
+            h = F.interpolate(h, size=(self.target_size, self.target_size),
+                              mode='bilinear', align_corners=False)
+        return h
 
 
 # ─── Categorical RSSM ─────────────────────────────────────
@@ -487,7 +494,8 @@ class Dreamer:
         if gradient_steps is None:
             gradient_steps = cfg.DREAMER_GRADIENT_STEPS
 
-        if buffer.total_steps < cfg.DREAMER_BATCH_SIZE * cfg.DREAMER_CHUNK_SIZE:
+        # Only need enough data for one chunk (sampling is with replacement)
+        if buffer.total_steps < cfg.DREAMER_CHUNK_SIZE * 2:
             return {}
 
         totals = {k: 0.0 for k in [
