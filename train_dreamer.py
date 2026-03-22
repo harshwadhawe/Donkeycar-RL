@@ -283,11 +283,12 @@ class RewardShapingWrapper(gym.Wrapper):
         if steer_sign != 0:
             self._prev_steer_sign = steer_sign
 
-        grace = 15       # ~0.75s at 20Hz — enough for any real corner
+        grace = 30       # ~1.5s at 20Hz — plenty for any real corner
         excess = max(self._same_dir_count - grace, 0)
-        sustained_penalty = 0.3 * (np.exp(0.04 * min(excess, 80)) - 1.0)
-        # excess=0 → 0, excess=20 (~1s past grace) → 0.20
-        # excess=40 (~2s) → 0.65, excess=60 (~3s) → 1.93
+        sustained_penalty = 0.2 * (np.exp(0.03 * min(excess, 100)) - 1.0)
+        # excess=0 → 0, excess=20 (~1s past grace) → 0.12
+        # excess=40 (~2s) → 0.27, excess=70 (~3.5s) → 0.56
+        # excess=100 (~5s) → 1.21 (capped)
 
         reward = (cte_reward + fwd_vel_reward
                   - steer_change_penalty - steer_mag_penalty
