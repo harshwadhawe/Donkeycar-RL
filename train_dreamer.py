@@ -214,6 +214,9 @@ class RewardShapingWrapper(gym.Wrapper):
         self.stuck_count = 0
         self.stuck_threshold = 10
         self._episode_num = 0  # set externally via set_episode()
+        # Sustained steering detection
+        self._same_dir_count = 0
+        self._prev_steer_sign = 0
         # Circling detection state
         self._start_pos = None
         self._window_pos = None  # position at start of current check window
@@ -227,6 +230,8 @@ class RewardShapingWrapper(gym.Wrapper):
         self.episode_step = 0
         self.last_steering = 0.0
         self.stuck_count = 0
+        self._same_dir_count = 0
+        self._prev_steer_sign = 0
         self._start_pos = None
         self._window_pos = None
         self._window_ctes = []
@@ -267,8 +272,26 @@ class RewardShapingWrapper(gym.Wrapper):
         steer_change_penalty = 0.1 * (steering - self.last_steering) ** 2
         steer_mag_penalty = 0.15 * steering ** 2
 
+        # Sustained steering penalty — catches smooth circling
+        # Tracks consecutive steps with steering in the same direction.
+        # Grace period allows legitimate corners; penalty ramps after.
+        steer_sign = np.sign(steering)
+        if steer_sign != 0 and steer_sign == self._prev_steer_sign:
+            self._same_dir_count += 1
+        else:
+            self._same_dir_count = 0
+        if steer_sign != 0:
+            self._prev_steer_sign = steer_sign
+
+        grace = 15       # ~0.75s at 20Hz — enough for any real corner
+        excess = max(self._same_dir_count - grace, 0)
+        sustained_penalty = 0.3 * (np.exp(0.04 * min(excess, 80)) - 1.0)
+        # excess=0 → 0, excess=20 (~1s past grace) → 0.20
+        # excess=40 (~2s) → 0.65, excess=60 (~3s) → 1.93
+
         reward = (cte_reward + fwd_vel_reward
-                  - steer_change_penalty - steer_mag_penalty)
+                  - steer_change_penalty - steer_mag_penalty
+                  - sustained_penalty)
         self.last_steering = steering
 
         # Standstill detection
