@@ -448,14 +448,14 @@ class Dreamer:
             # We must disable CUDAGraphs to prevent memory overwriting errors.
             self.rssm = torch.compile(
                 self.rssm, 
-                options={"disable_cudagraphs": True}
+                options={"triton.cudagraphs": False}
             )
             
             # The Actor contains torch.distributions sampling which also struggles
             # with aggressive CUDAGraphs. Disable them here too.
             self.actor = torch.compile(
                 self.actor, 
-                options={"disable_cudagraphs": True}
+                options={"triton.cudagraphs": False}
             )
         # Optimizers
         world_params = self._world_params()
