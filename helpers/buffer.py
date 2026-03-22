@@ -1,170 +1,87 @@
 """
-Replay buffers for RL agents.
-
-- ReplayBuffer: flat transition buffer for SAC
-- EpisodeBuffer: episode-based sequential buffer for Dreamer (RSSM needs sequences)
+buffer.py — Episode Sequence Buffer for Dreamer
 """
-
-import random
-from collections import deque
-
+import os
 import numpy as np
-import torch
-from . import config as cfg
-
-
-class ReplayBuffer:
-    """Flat transition buffer for SAC+VAE.
-    Stores (image, cmd_history, action, reward, next_image, next_cmd, done).
-    """
-
-    def __init__(self, max_size=1_000_000):
-        self.buffer = deque(maxlen=max_size)
-
-    def push(self, image, cmd_history, action, reward, next_image, next_cmd, done):
-        self.buffer.append((
-            image.cpu(), cmd_history.cpu(), action.cpu(),
-            torch.tensor([reward], dtype=torch.float32),
-            next_image.cpu(), next_cmd.cpu(),
-            torch.tensor([1.0 - float(done)], dtype=torch.float32)
-        ))
-
-    def sample(self, batch_size):
-        batch = random.choices(self.buffer, k=batch_size)
-        images, cmds, actions, rewards, next_images, next_cmds, not_dones = zip(*batch)
-        return (
-            torch.stack(images), torch.stack(cmds), torch.stack(actions),
-            torch.stack(rewards), torch.stack(next_images), torch.stack(next_cmds),
-            torch.stack(not_dones)
-        )
-
-    def __len__(self):
-        return len(self.buffer)
-
 
 class EpisodeBuffer:
-    """
-    Episode-based replay buffer for Dreamer.
-
-    Stores complete episodes as dicts of {observations, actions, rewards, dones}.
-    Samples random chunks of length chunk_size for RSSM training.
-    """
-
-    def __init__(self, max_steps=1_000_000, obs_shape=None, action_dim=2):
+    def __init__(self, max_steps, obs_shape, action_dim):
         self.max_steps = max_steps
-        if obs_shape is None:
-            channels = 1 if not cfg.RGB else 3
-            obs_shape = (channels, cfg.IMAGE_SIZE, cfg.IMAGE_SIZE)
         self.obs_shape = obs_shape
         self.action_dim = action_dim
-
-        # Storage as flat arrays (ring buffer over total steps)
-        self.observations = np.zeros((max_steps, *obs_shape), dtype=np.float32)
-        self.actions = np.zeros((max_steps, action_dim), dtype=np.float32)
-        self.rewards = np.zeros(max_steps, dtype=np.float32)
-        self.dones = np.zeros(max_steps, dtype=np.float32)
-
-        self.idx = 0        # current write position
-        self.full = False    # whether buffer has wrapped
-        # Each entry is (start_idx, end_idx) for completed episodes
-        self._episodes = []
-        self._current_start = None
-
-    @property
-    def total_steps(self):
-        return self.max_steps if self.full else self.idx
-
-    @property
-    def num_episodes(self):
-        return len(self._episodes)
-
-    @property
-    def episode_starts(self):
-        """For backward compatibility (logging)."""
-        return [s for s, e in self._episodes]
+        
+        # Pre-allocate arrays
+        self.obs = np.zeros((self.max_steps, *self.obs_shape), dtype=np.float32)
+        self.actions = np.zeros((self.max_steps, self.action_dim), dtype=np.float32)
+        self.rewards = np.zeros(self.max_steps, dtype=np.float32)
+        self.dones = np.zeros(self.max_steps, dtype=bool)
+        
+        self.ptr = 0
+        self.size = 0
+        self.total_steps = 0
 
     def add_step(self, obs, action, reward, done):
-        """
-        Add a single step. obs is a numpy array of shape obs_shape.
-        Call with done=True to mark episode end.
-        """
-        self.observations[self.idx] = obs
-        self.actions[self.idx] = action
-        self.rewards[self.idx] = reward
-        self.dones[self.idx] = float(done)
+        self.obs[self.ptr] = obs
+        self.actions[self.ptr] = action
+        self.rewards[self.ptr] = reward
+        self.dones[self.ptr] = done
+        
+        self.ptr = (self.ptr + 1) % self.max_steps
+        self.size = min(self.size + 1, self.max_steps)
+        self.total_steps += 1
 
-        if self._current_start is None:
-            self._current_start = self.idx
-
-        self.idx = (self.idx + 1) % self.max_steps
-        if self.idx == 0:
-            self.full = True
-
-        # Prune episodes whose data has been overwritten by the ring buffer
-        if self.full:
-            self._episodes = [
-                (s, e) for s, e in self._episodes
-                if not self._is_overwritten(s, e)
-            ]
-
-        if done:
-            # Record completed episode with its end index (inclusive)
-            end_idx = (self.idx - 1) % self.max_steps
-            self._episodes.append((self._current_start, end_idx))
-            self._current_start = None
-
-    def _is_overwritten(self, start, end):
-        """
-        Check if an episode [start..end] has been partially overwritten.
-        The write pointer (self.idx) is the next position to be written.
-        After wraparound, valid data is [self.idx .. self.idx-1] mod max_steps.
-        An episode is overwritten if self.idx has advanced past its start.
-        Since episodes are appended chronologically, we check if start is
-        in the overwritten zone by comparing ring-buffer distances.
-        """
-        dist = (start - self.idx) % self.max_steps
-        return dist == 0
-
-    def sample_chunks(self, batch_size, chunk_size):
-        """
-        Sample batch_size random chunks of length chunk_size.
-
-        Returns:
-            observations: (chunk_size, batch_size, *obs_shape)
-            actions:      (chunk_size, batch_size, action_dim)
-            rewards:      (chunk_size, batch_size)
-            dones:        (chunk_size, batch_size)
-        """
-        # Build valid episodes list (episode-level, not start-level — much faster)
-        valid_episodes = []
-        for ep_start, ep_end in self._episodes:
-            ep_len = (ep_end - ep_start) % self.max_steps + 1
-            if ep_len >= chunk_size:
-                valid_episodes.append((ep_start, ep_len))
-
-        if len(valid_episodes) == 0:
-            return None
-
-        # Sample: pick random episode, then random offset within it
-        obs_chunks = np.zeros((chunk_size, batch_size, *self.obs_shape), dtype=np.float32)
-        act_chunks = np.zeros((chunk_size, batch_size, self.action_dim), dtype=np.float32)
-        rew_chunks = np.zeros((chunk_size, batch_size), dtype=np.float32)
-        done_chunks = np.zeros((chunk_size, batch_size), dtype=np.float32)
-
-        for b in range(batch_size):
-            ep_start, ep_len = random.choice(valid_episodes)
-            offset = random.randint(0, ep_len - chunk_size)
-            start = (ep_start + offset) % self.max_steps
-
-            indices = [(start + t) % self.max_steps for t in range(chunk_size)]
-            obs_chunks[:, b] = self.observations[indices]
-            act_chunks[:, b] = self.actions[indices]
-            rew_chunks[:, b] = self.rewards[indices]
-            done_chunks[:, b] = self.dones[indices]
-
-        return (
-            torch.from_numpy(obs_chunks),
-            torch.from_numpy(act_chunks),
-            torch.from_numpy(rew_chunks),
-            torch.from_numpy(done_chunks),
+    def sample(self, batch_size, chunk_size):
+        """Samples contiguous sequences of shape (batch_size, chunk_size, ...)"""
+        # Find valid starting indices (can't sample a chunk that wraps around or goes past self.size)
+        valid_starts = np.arange(self.size - chunk_size)
+        
+        # Filter out starts where an episode terminates midway through the chunk
+        # Dreamer can handle boundary resets, but for simplicity, we avoid crossing terminal states
+        dones_view = sum(
+            np.roll(self.dones[:self.size], -i) for i in range(chunk_size - 1)
         )
+        valid_starts = valid_starts[dones_view[:len(valid_starts)] == 0]
+        
+        if len(valid_starts) < batch_size:
+            # Fallback if buffer is too empty/fragmented
+            idx = np.random.randint(0, self.size - chunk_size, size=batch_size)
+        else:
+            idx = np.random.choice(valid_starts, size=batch_size)
+
+        obs_batch = np.stack([self.obs[i : i + chunk_size] for i in idx])
+        act_batch = np.stack([self.actions[i : i + chunk_size] for i in idx])
+        rew_batch = np.stack([self.rewards[i : i + chunk_size] for i in idx])
+        done_batch = np.stack([self.dones[i : i + chunk_size] for i in idx])
+
+        return obs_batch, act_batch, rew_batch, done_batch
+
+    def save(self, filepath):
+        """Saves buffer memory to a compressed NumPy archive."""
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        if not filepath.endswith('.npz'):
+            filepath += '.npz'
+            
+        np.savez_compressed(
+            filepath,
+            obs=self.obs[:self.size],
+            actions=self.actions[:self.size],
+            rewards=self.rewards[:self.size],
+            dones=self.dones[:self.size]
+        )
+
+    def load(self, filepath):
+        """Loads buffer memory from a compressed NumPy archive."""
+        if not filepath.endswith('.npz'):
+            filepath += '.npz'
+            
+        if os.path.exists(filepath):
+            data = np.load(filepath)
+            size = len(data['rewards'])
+            self.obs[:size] = data['obs']
+            self.actions[:size] = data['actions']
+            self.rewards[:size] = data['rewards']
+            self.dones[:size] = data['dones']
+            
+            self.size = size
+            self.ptr = size % self.max_steps
+            self.total_steps = size

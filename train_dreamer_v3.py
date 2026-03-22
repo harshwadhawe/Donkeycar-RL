@@ -64,9 +64,9 @@ def get_device():
 # Image Preprocessing Wrapper
 # ==============================================================================
 class DonkeyPreprocessWrapper(gym.ObservationWrapper):
-    """Preprocess donkey images for Dreamer: crop, resize, grayscale, normalize."""
+    """Preprocess donkey images for Dreamer: crop, resize, normalize (RGB forced)."""
 
-    def __init__(self, env, crop_top=40, target_size=cfg.IMAGE_SIZE, grayscale=True):
+    def __init__(self, env, crop_top=40, target_size=cfg.IMAGE_SIZE, grayscale=False):
         super().__init__(env)
         self.crop_top = crop_top
         self.target_size = target_size
@@ -97,19 +97,13 @@ class DonkeyPreprocessWrapper(gym.ObservationWrapper):
 class CTEEstimatorWrapper(gym.Wrapper):
     """
     Estimate cross-track error from camera image when the sim doesn't provide it.
-
-    Looks at the bottom strip of the raw image (road area visible to the car).
-    The road is darker than the grass/shoulder. We find the road centroid and
-    compute its offset from image center → estimated CTE.
-
-    Must be placed BEFORE DonkeyPreprocessWrapper (needs raw 120x160x3 image).
     """
 
     def __init__(self, env, bottom_rows=30, smooth_alpha=0.3):
         super().__init__(env)
         self.bottom_rows = bottom_rows
-        self.smooth_alpha = smooth_alpha  # EMA smoothing (lower = smoother)
-        self._cte_available = None  # auto-detect on first step
+        self.smooth_alpha = smooth_alpha  
+        self._cte_available = None  
         self._smooth_cte = 0.0
 
     def reset(self, **kwargs):
@@ -122,14 +116,12 @@ class CTEEstimatorWrapper(gym.Wrapper):
 
         sim_cte = float(info.get("cte", 0.0))
 
-        # Auto-detect: if sim provides CTE, don't override
         if self._cte_available is None and abs(sim_cte) > 1e-6:
             self._cte_available = True
 
         if self._cte_available:
             return obs, reward, terminated, truncated, info
 
-        # Estimate CTE from image with temporal smoothing
         raw_cte = self._estimate_cte(obs)
         self._smooth_cte = (self.smooth_alpha * raw_cte +
                             (1 - self.smooth_alpha) * self._smooth_cte)
@@ -139,84 +131,64 @@ class CTEEstimatorWrapper(gym.Wrapper):
         return obs, reward, terminated, truncated, info
 
     def _estimate_cte(self, obs):
-        """
-        Estimate CTE from raw camera image (H, W, 3) uint8.
-
-        Uses multiple bottom strips at different heights for robustness.
-        Road is darker than grass — find road centroid vs image center.
-        """
         h, w = obs.shape[:2]
-
-        # Sample 3 strips at different heights for robustness
         strips = [
-            obs[h - 20:h - 10, :, :],  # near (most reliable)
-            obs[h - 35:h - 25, :, :],  # mid
-            obs[h - 50:h - 40, :, :],  # far
+            obs[h - 20:h - 10, :, :],  
+            obs[h - 35:h - 25, :, :],  
+            obs[h - 50:h - 40, :, :],  
         ]
-        strip_weights = [0.5, 0.3, 0.2]  # trust near strips more
+        strip_weights = [0.5, 0.3, 0.2]  
 
         total_offset = 0.0
         total_weight = 0.0
 
         for strip, sw in zip(strips, strip_weights):
             gray = cv2.cvtColor(strip, cv2.COLOR_RGB2GRAY)
-
-            # Adaptive threshold: road is darker than the mean
             mean_val = np.mean(gray)
             road_mask = gray < mean_val
-
             road_cols = np.where(road_mask)
             if len(road_cols[1]) < 5:
                 continue
 
-            # Weighted centroid (darker = more confident it's road)
             weights = mean_val - gray[road_mask]
             centroid = np.average(road_cols[1], weights=weights)
             center = w / 2.0
 
-            offset = (centroid - center) / center  # [-1, 1]
+            offset = (centroid - center) / center  
             total_offset += offset * sw
             total_weight += sw
 
         if total_weight < 0.1:
             return 0.0
 
-        # Scale to CTE range [-3, 3]
         cte = (total_offset / total_weight) * 3.0
         return float(cte)
 
 
 # ==============================================================================
-# Reward Shaping Wrapper (Breadcrumb Anti-Looping)
+# Reward Shaping Wrapper (Velocity + Smoothness)
 # ==============================================================================
 class RewardShapingWrapper(gym.Wrapper):
     """
-    Sparser, objective-driven reward shaping for Dreamer.
-    Rewards forward velocity and low CTE, but uses a strict 'Breadcrumb' 
-    trail to instantly terminate the episode if the car loops back on its own recent path.
+    Rewards forward velocity and penalizes jerky steering without breaking the Markov property.
+    Uses a 10Hz calibrated breadcrumb trail to instantly kill donuts.
     """
-
-    CURRICULUM_CTE_PHASE = 80     
-    CURRICULUM_BLEND_PHASE = 120  
 
     def __init__(self, env, max_episode_steps=None):
         super().__init__(env)
         self.episode_step = 0
         self.max_episode_steps = max_episode_steps or cfg.DREAMER_MAX_EPISODE_STEPS
-        self.stuck_count = 0
-        self.stuck_threshold = 10
-        self._episode_num = 0  
         
-        # Store tuples of (step_number, x_pos, z_pos)
         self.breadcrumbs = []
-
-    def set_episode(self, episode_num):
-        self._episode_num = episode_num
+        self.stuck_count = 0
+        self.stuck_threshold = 15  # 1.5 seconds at 10Hz
+        self.prev_steer = 0.0
 
     def reset(self, **kwargs):
         self.episode_step = 0
-        self.stuck_count = 0
         self.breadcrumbs = []
+        self.stuck_count = 0
+        self.prev_steer = 0.0
         return self.env.reset(**kwargs)
 
     def step(self, action):
@@ -225,22 +197,41 @@ class RewardShapingWrapper(gym.Wrapper):
 
         cte = float(info.get("cte", 0.0))
         speed = float(info.get("speed", 0.0))
-        forward_vel = float(info.get("forward_vel", 0.0))
         cur_pos = info.get("pos", None)
+        steer = float(action[0])
+        
+        reward = 0.0
 
-        ep = self._episode_num
-        if ep < self.CURRICULUM_CTE_PHASE:
-            alpha = 0.0
-        elif ep < self.CURRICULUM_BLEND_PHASE:
-            alpha = (ep - self.CURRICULUM_CTE_PHASE) / (
-                self.CURRICULUM_BLEND_PHASE - self.CURRICULUM_CTE_PHASE)
-        else:
-            alpha = 1.0
-
-        # Base Reward: Smooth CTE bell curve + Speed blending
+        # 1. Base Reward: Stay on the track (mild bell curve)
         cte_reward = 2.0 * np.exp(-(cte / 1.0) ** 2)
-        fwd_vel_reward = (1.0 + alpha) * max(forward_vel, 0.0)
-        reward = cte_reward + fwd_vel_reward
+        reward += cte_reward
+
+        # 2. Progression Reward: Pure velocity mapping
+        reward += (speed * 0.5) 
+
+        # 3. Action Smoothness Penalty (Replaces SmoothActionWrapper)
+        steer_diff = abs(steer - self.prev_steer)
+        reward -= (steer_diff * 1.5)  # Penalize jerky changes in steering heavily
+        self.prev_steer = steer
+
+        # 4. Calibrated Breadcrumb Anti-Looping (10Hz assumption)
+        if cur_pos is not None and len(cur_pos) >= 3:
+            x, z = cur_pos[0], cur_pos[2]
+            
+            # Drop a breadcrumb every 5 steps (0.5 seconds)
+            if self.episode_step % 5 == 0:
+                self.breadcrumbs.append((self.episode_step, x, z))
+            
+            # Check for path crossings from 2 to 7 seconds ago (20 to 70 steps)
+            for step_num, bx, bz in self.breadcrumbs:
+                age_steps = self.episode_step - step_num
+                
+                if 20 <= age_steps <= 70:
+                    dist = ((x - bx)**2 + (z - bz)**2)**0.5
+                    if dist < 1.5:
+                        terminated = True
+                        info["circle_terminated"] = True
+                        break
 
         # Standstill detection
         if speed < 0.1 and self.episode_step > 10:
@@ -252,29 +243,9 @@ class RewardShapingWrapper(gym.Wrapper):
         if self.stuck_count >= self.stuck_threshold:
             terminated = True
 
+        # Track bounds detection
         if abs(cte) > 2.5:
             terminated = True
-
-        # The Breadcrumb Anti-Looping Check
-        if cur_pos is not None and len(cur_pos) >= 3:
-            x, z = cur_pos[0], cur_pos[2]
-            
-            # Drop a breadcrumb every 10 steps (0.5 seconds at 20Hz)
-            if self.episode_step % 10 == 0:
-                self.breadcrumbs.append((self.episode_step, x, z))
-            
-            # Check if we are crossing our own path from 3 to 10 seconds ago (60 to 200 steps)
-            for step_num, bx, bz in self.breadcrumbs:
-                age_steps = self.episode_step - step_num
-                
-                if 60 <= age_steps <= 200:
-                    dist = ((x - bx)**2 + (z - bz)**2)**0.5
-                    
-                    # If we are within 1.5 meters of a recent old position, we are looping
-                    if dist < 1.5:
-                        terminated = True
-                        info["circle_terminated"] = True
-                        break
 
         if terminated or truncated:
             reward -= 10.0
@@ -283,27 +254,6 @@ class RewardShapingWrapper(gym.Wrapper):
             truncated = True
 
         return obs, reward, terminated, truncated, info
-# ==============================================================================
-# Smooth Action Wrapper
-# ==============================================================================
-class SmoothActionWrapper(gym.Wrapper):
-    """Exponential moving average on actions."""
-
-    def __init__(self, env, alpha=0.5):
-        super().__init__(env)
-        self.alpha = alpha
-        self._prev = None
-
-    def reset(self, **kwargs):
-        self._prev = None
-        return self.env.reset(**kwargs)
-
-    def step(self, action):
-        action = np.asarray(action, dtype=np.float32)
-        if self._prev is not None:
-            action = self.alpha * action + (1 - self.alpha) * self._prev
-        self._prev = action
-        return self.env.step(action)
 
 
 # ==============================================================================
@@ -318,13 +268,13 @@ def make_env(env_id, conf):
         )
     else:
         env = gym.make(env_id, conf=conf)
-    # CTE estimator MUST come before preprocessing (needs raw image)
     env = CTEEstimatorWrapper(env)
+    
+    # FORCE RGB: grayscale=False
     env = DonkeyPreprocessWrapper(
         env, crop_top=cfg.IMAGE_CROP_TOP,
-        target_size=cfg.IMAGE_SIZE, grayscale=not cfg.RGB
+        target_size=cfg.IMAGE_SIZE, grayscale=False 
     )
-    env = SmoothActionWrapper(env, alpha=0.5)
     env = RewardShapingWrapper(env)
     return env
 
@@ -339,8 +289,6 @@ def train(args):
 
     track = args.track or getattr(dk_cfg, 'DONKEY_GYM_ENV_NAME', 'donkey-generated-track-v0')
     sim_path = getattr(dk_cfg, 'DONKEY_SIM_PATH', 'manual')
-
-    # Short track name for file naming (e.g. "generated-track-v0", "warehouse-v0")
     track_short = track.replace('donkey-', '').replace('_', '-')
 
     conf = {
@@ -355,8 +303,8 @@ def train(args):
         ),
         "log_level": 20,
         "throttle_max": 1.0,
-        "max_cte": 3.0,        # terminate early when hopelessly off-track
-        "start_delay": 5.0,    # give sim time to launch before connecting
+        "max_cte": 3.0,        
+        "start_delay": 5.0,    
     }
 
     logger.info(f'Track: {track}')
@@ -364,9 +312,7 @@ def train(args):
 
     env = make_env(track, conf)
 
-    # Dreamer agent
     dreamer = Dreamer(device=device)
-    # Include track name as subdirectory
     if args.model == 'models/dreamer_v3.pth':
         model_path = f'models/{track_short}/dreamer.pth'
     else:
@@ -376,8 +322,8 @@ def train(args):
         dreamer.load(model_path)
         logger.info(f'Resumed from {model_path}')
 
-    # Replay buffer
-    channels = 1 if not cfg.RGB else 3
+    # Forced to 3 channels for RGB
+    channels = 3 
     buffer = EpisodeBuffer(
         max_steps=cfg.DREAMER_BUFFER_SIZE,
         obs_shape=(channels, cfg.IMAGE_SIZE, cfg.IMAGE_SIZE),
@@ -387,7 +333,6 @@ def train(args):
     os.makedirs(os.path.dirname(model_path) or '.', exist_ok=True)
     os.makedirs('logs/tb_logs', exist_ok=True)
 
-    # Optional: TensorBoard (include track in log dir)
     try:
         from torch.utils.tensorboard import SummaryWriter
         writer = SummaryWriter(f'logs/tb_logs/dreamer_{track_short}')
@@ -396,9 +341,8 @@ def train(args):
 
     total_steps = 0
     best_reward = -float('inf')
-    best_test_score = -float('inf')  # displacement-based, ignores fake laps
+    best_test_score = -float('inf')  
 
-    # Lap validation: multi-factor (not just time)
     real_lap_count = 0
     fake_lap_count = 0
 
@@ -406,22 +350,10 @@ def train(args):
     logger.info(f"DREAMER v3 TRAINING")
     logger.info(f"  Episodes: {args.episodes}")
     logger.info(f"  Model: {model_path}")
-    logger.info(f"  Curriculum: CTE-only eps 0-{RewardShapingWrapper.CURRICULUM_CTE_PHASE}, "
-                f"blend to ep {RewardShapingWrapper.CURRICULUM_BLEND_PHASE}, "
-                f"then full speed+CTE")
     logger.info("=" * 60)
 
     try:
         for episode in range(args.episodes):
-            # Update curriculum phase
-            reward_wrapper = env
-            while hasattr(reward_wrapper, 'env'):
-                if isinstance(reward_wrapper, RewardShapingWrapper):
-                    break
-                reward_wrapper = reward_wrapper.env
-            if isinstance(reward_wrapper, RewardShapingWrapper):
-                reward_wrapper.set_episode(episode)
-
             obs, info = env.reset()
             dreamer.reset_belief()
             last_action = np.zeros(2, dtype=np.float32)
@@ -430,18 +362,16 @@ def train(args):
             episode_steps = 0
             episode_fwd_vels = []
             episode_ctes = []
-            episode_steers = []  # signed steering values
+            episode_steers = []  
             start_pos = None
             max_displacement = 0.0
             ep_real_laps = 0
             ep_fake_laps = 0
-            last_lap_time = None  # track sim-reported lap time changes
-            # Per-lap-window metrics (reset each time a lap completes)
+            last_lap_time = None  
             lap_window_ctes = []
             lap_window_fwd_vels = []
             lap_window_max_disp = 0.0
             lap_window_start_pos = None
-            positions = []  # sample positions every 10 steps
             t0 = time.time()
 
             is_seed = episode < cfg.DREAMER_SEED_EPISODES
@@ -452,14 +382,18 @@ def train(args):
                 action_tensor = torch.from_numpy(last_action).unsqueeze(0)
 
                 if is_seed:
-                    # P-controller with noise: drives the track so world model
-                    # sees actual turns, not just the first 3m before crashing
-                    seed_cte = float(info.get("cte", 0.0))
-                    steer = np.clip(-0.7 * seed_cte, -1.0, 1.0)
-                    steer += np.random.normal(0, 0.15)
-                    steer = float(np.clip(steer, -1.0, 1.0))
-                    action = np.array([steer, cfg.DREAMER_THROTTLE_BASE],
-                                      dtype=np.float32)
+                    # 30% chance for completely random actions to map edge cases/crashes
+                    if np.random.rand() < 0.3:
+                        steer = np.random.uniform(-1.0, 1.0)
+                        throttle = np.random.uniform(0.0, cfg.DREAMER_THROTTLE_BASE * 1.5)
+                    else:
+                        seed_cte = float(info.get("cte", 0.0))
+                        steer = np.clip(-0.7 * seed_cte, -1.0, 1.0)
+                        steer += np.random.normal(0, 0.4) # Increased baseline noise
+                        steer = float(np.clip(steer, -1.0, 1.0))
+                        throttle = cfg.DREAMER_THROTTLE_BASE
+                    
+                    action = np.array([steer, throttle], dtype=np.float32)
                 else:
                     action = dreamer.select_action(
                         obs_tensor, action_tensor, explore=True
@@ -475,19 +409,14 @@ def train(args):
                 episode_ctes.append(step_cte)
                 episode_steers.append(steer_val)
 
-                # Track displacement from real pos
                 cur_pos = info.get("pos", (0, 0, 0))
 
-                # Sample positions for return-to-start detection
-                if episode_steps % 10 == 0 and cur_pos is not None:
-                    positions.append(cur_pos)
                 if start_pos is None:
                     start_pos = cur_pos
                 dx = cur_pos[0] - start_pos[0]
                 dz = cur_pos[2] - start_pos[2]
                 max_displacement = max(max_displacement, (dx**2 + dz**2)**0.5)
 
-                # Accumulate per-lap-window metrics
                 lap_window_ctes.append(abs(step_cte))
                 lap_window_fwd_vels.append(fwd_vel)
                 if lap_window_start_pos is None:
@@ -497,22 +426,15 @@ def train(args):
                 lap_window_max_disp = max(lap_window_max_disp,
                                           (ldx**2 + ldz**2)**0.5)
 
-                # Detect and classify laps — multi-factor validation
                 cur_lap_time = info.get("last_lap_time", None)
                 if cur_lap_time is not None:
                     cur_lap_time = float(cur_lap_time)
-                    if last_lap_time is None or abs(cur_lap_time - last_lap_time) > 0.1:
-                        # New lap reported by sim — validate it
-                        avg_lap_cte = (np.mean(lap_window_ctes)
-                                       if lap_window_ctes else 99.0)
-                        avg_lap_fwd = (np.mean(lap_window_fwd_vels)
-                                       if lap_window_fwd_vels else 0.0)
+                    if cur_lap_time > 5.0 and (last_lap_time is None or abs(cur_lap_time - last_lap_time) > 0.1):
+                        avg_lap_cte = (np.mean(lap_window_ctes) if lap_window_ctes else 99.0)
+                        avg_lap_fwd = (np.mean(lap_window_fwd_vels) if lap_window_fwd_vels else 0.0)
                         lap_disp = lap_window_max_disp
 
-                        # Real lap: stayed on track + covered ground + moved forward
-                        is_real = (avg_lap_cte < 2.0 and
-                                   lap_disp > 5.0 and
-                                   avg_lap_fwd > 0.3)
+                        is_real = (avg_lap_cte < 2.0 and lap_disp > 5.0 and avg_lap_fwd > 0.3)
 
                         if is_real:
                             ep_real_laps += 1
@@ -526,26 +448,12 @@ def train(args):
                         elif cur_lap_time > 0.5:
                             ep_fake_laps += 1
                             fake_lap_count += 1
-                            logger.debug(
-                                f'  FAKE LAP {cur_lap_time:.1f}s '
-                                f'(|cte|={avg_lap_cte:.2f}, '
-                                f'disp={lap_disp:.1f}m, '
-                                f'fwd={avg_lap_fwd:.2f})')
 
                         last_lap_time = cur_lap_time
-                        # Reset lap window for next lap
                         lap_window_ctes = []
                         lap_window_fwd_vels = []
                         lap_window_max_disp = 0.0
                         lap_window_start_pos = cur_pos
-
-                # Diagnostic: first episode
-                if episode == 0 and episode_steps == 1:
-                    logger.info(f'FIRST STEP INFO KEYS: {sorted(info.keys())}')
-                    logger.info(
-                        f'FIRST STEP INFO: cte={info.get("cte")}, '
-                        f'forward_vel={info.get("forward_vel")}, '
-                        f'pos={info.get("pos")}')
 
                 buffer.add_step(obs, action, reward, done)
 
@@ -562,13 +470,12 @@ def train(args):
             avg_cte = np.mean(np.abs(episode_ctes)) if episode_ctes else 0.0
             avg_steer = np.mean(np.abs(episode_steers)) if episode_steers else 0.0
 
-            # Circling diagnostics
             steers_arr = np.array(episode_steers) if episode_steers else np.zeros(1)
-            left_pct = np.mean(steers_arr < -0.05) * 100  # % steps turning left
-            right_pct = np.mean(steers_arr > 0.05) * 100   # % steps turning right
-            steer_bias = max(left_pct, right_pct)           # dominant direction %
-            mean_steer = np.mean(steers_arr)                # signed mean (0 = balanced)
-            # End-displacement: how far from start at episode end
+            left_pct = np.mean(steers_arr < -0.05) * 100  
+            right_pct = np.mean(steers_arr > 0.05) * 100   
+            steer_bias = max(left_pct, right_pct)           
+            mean_steer = np.mean(steers_arr)                
+            
             end_disp = 0.0
             if start_pos and cur_pos:
                 end_disp = ((cur_pos[0]-start_pos[0])**2 +
@@ -580,12 +487,6 @@ def train(args):
             circle_str = ''
             if info.get("circle_terminated"):
                 circle_str = ' [CIRCLE KILLED]'
-
-            # Detect likely circling: high steer bias + low displacement + no real laps
-            is_circling = (steer_bias > 80 and max_displacement < 5.0
-                           and ep_real_laps == 0 and episode_steps > 30)
-            if is_circling:
-                circle_str += ' [LIKELY CIRCLING]'
 
             logger.info(
                 f'Episode {episode}: steps={episode_steps}, '
@@ -609,8 +510,6 @@ def train(args):
                 writer.add_scalar('episode/max_displacement',
                                   max_displacement, episode)
 
-            # World model warmup: after seed episodes collected, train WM
-            # for 100 steps before actor ever gets a gradient
             if episode == cfg.DREAMER_SEED_EPISODES:
                 warmup_steps = 100
                 logger.info(f'World model warmup: {warmup_steps} steps '
@@ -629,34 +528,20 @@ def train(args):
                         f'kl={warmup_metrics.get("kl_loss", 0):.4f}'
                     )
 
-            # Train after seed episodes
             if episode >= cfg.DREAMER_SEED_EPISODES:
                 gradient_steps = max(1, int(
                     episode_steps * cfg.DREAMER_TRAIN_RATIO /
                     (cfg.DREAMER_BATCH_SIZE * cfg.DREAMER_CHUNK_SIZE)
                 ))
-                logger.info(f'Training for {gradient_steps} steps '
-                            f'(episode_steps={episode_steps}, '
-                            f'ratio={cfg.DREAMER_TRAIN_RATIO})...')
                 t0 = time.time()
                 metrics = dreamer.update(buffer, gradient_steps=gradient_steps)
                 dt = time.time() - t0
 
-                if metrics:
-                    logger.info(
-                        f'Training done in {dt:.1f}s | '
-                        f'world={metrics["world_loss"]:.4f} '
-                        f'obs={metrics["obs_loss"]:.4f} '
-                        f'rew={metrics["reward_loss"]:.4f} '
-                        f'actor={metrics["actor_loss"]:.4f} '
-                        f'value={metrics["value_loss"]:.4f} '
-                        f'kl={metrics["kl_loss"]:.4f}'
-                    )
-                    if writer:
-                        for k, v in metrics.items():
-                            writer.add_scalar(f'train/{k}', v, episode)
+                if metrics and writer:
+                    for k, v in metrics.items():
+                        writer.add_scalar(f'train/{k}', v, episode)
 
-            # ── Test Episode (deterministic, every 10 eps) ──
+            # ── Test Episode ──
             if (episode >= cfg.DREAMER_SEED_EPISODES and
                     (episode + 1) % 10 == 0):
                 test_obs, test_info = env.reset()
@@ -693,7 +578,6 @@ def train(args):
                               (tp[2]-test_start[2])**2)**0.5
                         test_max_disp = max(test_max_disp, td)
 
-                        # Accumulate per-lap-window metrics
                         t_cte = abs(float(test_info.get("cte", 0.0)))
                         t_fwd = float(test_info.get("forward_vel", 0.0))
                         test_lap_ctes.append(t_cte)
@@ -704,44 +588,33 @@ def train(args):
                                (tp[2]-test_lap_start[2])**2)**0.5
                         test_lap_max_disp_w = max(test_lap_max_disp_w, tld)
 
-                        # Validate laps — same multi-factor check
                         tlt = test_info.get("last_lap_time", None)
                         if tlt is not None:
                             tlt = float(tlt)
-                            if test_last_lap is None or abs(tlt - test_last_lap) > 0.1:
+                            if tlt > 5.0 and (test_last_lap is None or abs(tlt - test_last_lap) > 0.1):
                                 avg_c = np.mean(test_lap_ctes) if test_lap_ctes else 99.0
                                 avg_f = np.mean(test_lap_fwds) if test_lap_fwds else 0.0
-                                is_real = (avg_c < 2.0 and
-                                           test_lap_max_disp_w > 5.0 and
-                                           avg_f > 0.3)
+                                is_real = (avg_c < 2.0 and test_lap_max_disp_w > 5.0 and avg_f > 0.3)
                                 if is_real:
                                     test_real_laps += 1
                                 elif tlt > 0.5:
                                     test_fake_laps += 1
                                 test_last_lap = tlt
-                                # Reset window
                                 test_lap_ctes = []
                                 test_lap_fwds = []
                                 test_lap_max_disp_w = 0.0
                                 test_lap_start = tp
 
                 test_avg = test_reward / max(test_steps, 1)
-                test_lap_str = ''
-                if test_real_laps or test_fake_laps:
-                    test_lap_str = f', laps={test_real_laps}real/{test_fake_laps}fake'
                 logger.info(
                     f'  TEST ep {episode}: steps={test_steps}, '
                     f'reward={test_reward:.1f} (avg={test_avg:.2f}/step), '
-                    f'disp={test_max_disp:.1f}m'
-                    f'{test_lap_str}')
+                    f'disp={test_max_disp:.1f}m')
                 if writer:
                     writer.add_scalar('test/reward', test_reward, episode)
                     writer.add_scalar('test/steps', test_steps, episode)
                     writer.add_scalar('test/displacement', test_max_disp, episode)
-                    writer.add_scalar('test/real_laps', test_real_laps, episode)
 
-                # Save best model based on test performance
-                # Score: displacement + big bonus per real lap
                 test_score = test_max_disp + test_real_laps * 50.0
                 if test_score > best_test_score:
                     best_test_score = test_score
@@ -752,7 +625,6 @@ def train(args):
                         f'(disp={test_max_disp:.1f}, real_laps={test_real_laps}), '
                         f'saved to {best_path}')
 
-            # Save checkpoint
             if episode_reward > best_reward:
                 best_reward = episode_reward
                 dreamer.save(model_path)
@@ -807,28 +679,16 @@ def evaluate(args):
         "start_delay": 5.0,
     }
 
-    logger.info(f'Track: {track}')
-    logger.info(f'Sim: {sim_path}')
-
     env = make_env(track, conf)
 
-    # Load model (use track subdirectory if default)
     dreamer = Dreamer(device=device)
-    if args.model == 'models/dreamer_v3.pth':
-        model_path = f'models/{track_short}/dreamer.pth'
-    else:
-        model_path = args.model
+    model_path = args.model if args.model != 'models/dreamer_v3.pth' else f'models/{track_short}/dreamer.pth'
+    
     if not os.path.exists(model_path):
         logger.error(f'Model not found: {model_path}')
         return
     dreamer.load(model_path)
     logger.info(f'Loaded model from {model_path}')
-
-    logger.info("=" * 60)
-    logger.info("DREAMER v3 EVALUATION (inference only)")
-    logger.info(f"  Episodes: {args.episodes}")
-    logger.info(f"  Model: {model_path}")
-    logger.info("=" * 60)
 
     try:
         for episode in range(args.episodes):
@@ -856,11 +716,11 @@ def evaluate(args):
                 episode_reward += reward
                 episode_steps += 1
 
-                # Count laps (skip step 1 — sim carries over last_lap_time from previous episode)
                 lap_time = info.get("last_lap_time", None)
                 if lap_time is not None and episode_steps > 1:
                     lap_time = float(lap_time)
-                    if last_lap_time is None or abs(lap_time - last_lap_time) > 0.1:
+                    # Suppress fake spawn laps by enforcing > 5.0s
+                    if lap_time > 5.0 and (last_lap_time is None or abs(lap_time - last_lap_time) > 0.1):
                         real_laps += 1
                         logger.info(
                             f'  LAP {lap_time:.1f}s '

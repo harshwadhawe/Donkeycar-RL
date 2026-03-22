@@ -64,9 +64,9 @@ def get_device():
 # Image Preprocessing Wrapper
 # ==============================================================================
 class DonkeyPreprocessWrapper(gym.ObservationWrapper):
-    """Preprocess donkey images for Dreamer: crop, resize, grayscale, normalize."""
+    """Preprocess donkey images for Dreamer: crop, resize, normalize (RGB forced)."""
 
-    def __init__(self, env, crop_top=40, target_size=cfg.IMAGE_SIZE, grayscale=True):
+    def __init__(self, env, crop_top=40, target_size=cfg.IMAGE_SIZE, grayscale=False):
         super().__init__(env)
         self.crop_top = crop_top
         self.target_size = target_size
@@ -166,11 +166,11 @@ class CTEEstimatorWrapper(gym.Wrapper):
 
 
 # ==============================================================================
-# Reward Shaping Wrapper (Pure Progression + Calibrated Breadcrumbs)
+# Reward Shaping Wrapper (Velocity + Smoothness)
 # ==============================================================================
 class RewardShapingWrapper(gym.Wrapper):
     """
-    Rewards ONLY true forward progression down the track.
+    Rewards forward velocity and penalizes jerky steering without breaking the Markov property.
     Uses a 10Hz calibrated breadcrumb trail to instantly kill donuts.
     """
 
@@ -179,18 +179,16 @@ class RewardShapingWrapper(gym.Wrapper):
         self.episode_step = 0
         self.max_episode_steps = max_episode_steps or cfg.DREAMER_MAX_EPISODE_STEPS
         
-        self.max_dist_from_start = 0.0
-        self.start_pos = None
         self.breadcrumbs = []
         self.stuck_count = 0
         self.stuck_threshold = 15  # 1.5 seconds at 10Hz
+        self.prev_steer = 0.0
 
     def reset(self, **kwargs):
         self.episode_step = 0
-        self.max_dist_from_start = 0.0
-        self.start_pos = None
         self.breadcrumbs = []
         self.stuck_count = 0
+        self.prev_steer = 0.0
         return self.env.reset(**kwargs)
 
     def step(self, action):
@@ -200,6 +198,7 @@ class RewardShapingWrapper(gym.Wrapper):
         cte = float(info.get("cte", 0.0))
         speed = float(info.get("speed", 0.0))
         cur_pos = info.get("pos", None)
+        steer = float(action[0])
         
         reward = 0.0
 
@@ -207,37 +206,32 @@ class RewardShapingWrapper(gym.Wrapper):
         cte_reward = 2.0 * np.exp(-(cte / 1.0) ** 2)
         reward += cte_reward
 
-        # 2. True Progression Reward
-        if cur_pos is not None:
-            if self.start_pos is None:
-                self.start_pos = cur_pos
-            
-            dist_from_start = ((cur_pos[0]-self.start_pos[0])**2 + (cur_pos[2]-self.start_pos[2])**2)**0.5
-            
-            if dist_from_start > self.max_dist_from_start:
-                progress = dist_from_start - self.max_dist_from_start
-                reward += (progress * 10.0) 
-                self.max_dist_from_start = dist_from_start
+        # 2. Progression Reward: Pure velocity mapping
+        reward += (speed * 0.5) 
 
-            # 3. Calibrated Breadcrumb Anti-Looping (10Hz assumption)
-            if len(cur_pos) >= 3:
-                x, z = cur_pos[0], cur_pos[2]
+        # 3. Action Smoothness Penalty (Replaces SmoothActionWrapper)
+        steer_diff = abs(steer - self.prev_steer)
+        reward -= (steer_diff * 1.5)  # Penalize jerky changes in steering heavily
+        self.prev_steer = steer
+
+        # 4. Calibrated Breadcrumb Anti-Looping (10Hz assumption)
+        if cur_pos is not None and len(cur_pos) >= 3:
+            x, z = cur_pos[0], cur_pos[2]
+            
+            # Drop a breadcrumb every 5 steps (0.5 seconds)
+            if self.episode_step % 5 == 0:
+                self.breadcrumbs.append((self.episode_step, x, z))
+            
+            # Check for path crossings from 2 to 7 seconds ago (20 to 70 steps)
+            for step_num, bx, bz in self.breadcrumbs:
+                age_steps = self.episode_step - step_num
                 
-                # Drop a breadcrumb every 5 steps (0.5 seconds)
-                if self.episode_step % 5 == 0:
-                    self.breadcrumbs.append((self.episode_step, x, z))
-                
-                # Check for path crossings from 2 to 7 seconds ago (20 to 70 steps)
-                # This ignores start-line crossings during lap completions (>120 steps)
-                for step_num, bx, bz in self.breadcrumbs:
-                    age_steps = self.episode_step - step_num
-                    
-                    if 20 <= age_steps <= 70:
-                        dist = ((x - bx)**2 + (z - bz)**2)**0.5
-                        if dist < 1.5:
-                            terminated = True
-                            info["circle_terminated"] = True
-                            break
+                if 20 <= age_steps <= 70:
+                    dist = ((x - bx)**2 + (z - bz)**2)**0.5
+                    if dist < 1.5:
+                        terminated = True
+                        info["circle_terminated"] = True
+                        break
 
         # Standstill detection
         if speed < 0.1 and self.episode_step > 10:
@@ -263,29 +257,6 @@ class RewardShapingWrapper(gym.Wrapper):
 
 
 # ==============================================================================
-# Smooth Action Wrapper
-# ==============================================================================
-class SmoothActionWrapper(gym.Wrapper):
-    """Exponential moving average on actions."""
-
-    def __init__(self, env, alpha=0.5):
-        super().__init__(env)
-        self.alpha = alpha
-        self._prev = None
-
-    def reset(self, **kwargs):
-        self._prev = None
-        return self.env.reset(**kwargs)
-
-    def step(self, action):
-        action = np.asarray(action, dtype=np.float32)
-        if self._prev is not None:
-            action = self.alpha * action + (1 - self.alpha) * self._prev
-        self._prev = action
-        return self.env.step(action)
-
-
-# ==============================================================================
 # Env Factory
 # ==============================================================================
 def make_env(env_id, conf):
@@ -298,11 +269,12 @@ def make_env(env_id, conf):
     else:
         env = gym.make(env_id, conf=conf)
     env = CTEEstimatorWrapper(env)
+    
+    # FORCE RGB: grayscale=False
     env = DonkeyPreprocessWrapper(
         env, crop_top=cfg.IMAGE_CROP_TOP,
-        target_size=cfg.IMAGE_SIZE, grayscale=not cfg.RGB
+        target_size=cfg.IMAGE_SIZE, grayscale=False 
     )
-    env = SmoothActionWrapper(env, alpha=0.5)
     env = RewardShapingWrapper(env)
     return env
 
@@ -350,7 +322,8 @@ def train(args):
         dreamer.load(model_path)
         logger.info(f'Resumed from {model_path}')
 
-    channels = 1 if not cfg.RGB else 3
+    # Forced to 3 channels for RGB
+    channels = 3 
     buffer = EpisodeBuffer(
         max_steps=cfg.DREAMER_BUFFER_SIZE,
         obs_shape=(channels, cfg.IMAGE_SIZE, cfg.IMAGE_SIZE),
@@ -399,7 +372,6 @@ def train(args):
             lap_window_fwd_vels = []
             lap_window_max_disp = 0.0
             lap_window_start_pos = None
-            positions = []  
             t0 = time.time()
 
             is_seed = episode < cfg.DREAMER_SEED_EPISODES
@@ -410,12 +382,18 @@ def train(args):
                 action_tensor = torch.from_numpy(last_action).unsqueeze(0)
 
                 if is_seed:
-                    seed_cte = float(info.get("cte", 0.0))
-                    steer = np.clip(-0.7 * seed_cte, -1.0, 1.0)
-                    steer += np.random.normal(0, 0.15)
-                    steer = float(np.clip(steer, -1.0, 1.0))
-                    action = np.array([steer, cfg.DREAMER_THROTTLE_BASE],
-                                      dtype=np.float32)
+                    # 30% chance for completely random actions to map edge cases/crashes
+                    if np.random.rand() < 0.3:
+                        steer = np.random.uniform(-1.0, 1.0)
+                        throttle = np.random.uniform(0.0, cfg.DREAMER_THROTTLE_BASE * 1.5)
+                    else:
+                        seed_cte = float(info.get("cte", 0.0))
+                        steer = np.clip(-0.7 * seed_cte, -1.0, 1.0)
+                        steer += np.random.normal(0, 0.4) # Increased baseline noise
+                        steer = float(np.clip(steer, -1.0, 1.0))
+                        throttle = cfg.DREAMER_THROTTLE_BASE
+                    
+                    action = np.array([steer, throttle], dtype=np.float32)
                 else:
                     action = dreamer.select_action(
                         obs_tensor, action_tensor, explore=True
@@ -451,7 +429,6 @@ def train(args):
                 cur_lap_time = info.get("last_lap_time", None)
                 if cur_lap_time is not None:
                     cur_lap_time = float(cur_lap_time)
-                    # Filter out fake 0.0s lap times that trigger at spawn
                     if cur_lap_time > 5.0 and (last_lap_time is None or abs(cur_lap_time - last_lap_time) > 0.1):
                         avg_lap_cte = (np.mean(lap_window_ctes) if lap_window_ctes else 99.0)
                         avg_lap_fwd = (np.mean(lap_window_fwd_vels) if lap_window_fwd_vels else 0.0)
