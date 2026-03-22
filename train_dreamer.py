@@ -400,6 +400,9 @@ def train(args):
     track = args.track or getattr(dk_cfg, 'DONKEY_GYM_ENV_NAME', 'donkey-generated-track-v0')
     sim_path = getattr(dk_cfg, 'DONKEY_SIM_PATH', 'manual')
 
+    # Short track name for file naming (e.g. "generated-track-v0", "warehouse-v0")
+    track_short = track.replace('donkey-', '').replace('_', '-')
+
     conf = {
         "exe_path": sim_path,
         "host": getattr(dk_cfg, 'SIM_HOST', '127.0.0.1'),
@@ -423,7 +426,11 @@ def train(args):
 
     # Dreamer agent
     dreamer = Dreamer(device=device)
-    model_path = args.model
+    # Include track name as subdirectory
+    if args.model == 'models/dreamer_v3.pth':
+        model_path = f'models/{track_short}/dreamer.pth'
+    else:
+        model_path = args.model
 
     if args.resume and os.path.exists(model_path):
         dreamer.load(model_path)
@@ -440,10 +447,10 @@ def train(args):
     os.makedirs(os.path.dirname(model_path) or '.', exist_ok=True)
     os.makedirs('logs/tb_logs', exist_ok=True)
 
-    # Optional: TensorBoard
+    # Optional: TensorBoard (include track in log dir)
     try:
         from torch.utils.tensorboard import SummaryWriter
-        writer = SummaryWriter('logs/tb_logs/dreamer')
+        writer = SummaryWriter(f'logs/tb_logs/dreamer_{track_short}')
     except ImportError:
         writer = None
 
@@ -856,6 +863,7 @@ def evaluate(args):
     logger.info(f'Device: {device}')
 
     track = args.track or getattr(dk_cfg, 'DONKEY_GYM_ENV_NAME', 'donkey-generated-track-v0')
+    track_short = track.replace('donkey-', '').replace('_', '-')
     sim_path = getattr(dk_cfg, 'DONKEY_SIM_PATH', 'manual')
 
     conf = {
@@ -879,9 +887,12 @@ def evaluate(args):
 
     env = make_env(track, conf)
 
-    # Load model
+    # Load model (use track subdirectory if default)
     dreamer = Dreamer(device=device)
-    model_path = args.model
+    if args.model == 'models/dreamer_v3.pth':
+        model_path = f'models/{track_short}/dreamer.pth'
+    else:
+        model_path = args.model
     if not os.path.exists(model_path):
         logger.error(f'Model not found: {model_path}')
         return
