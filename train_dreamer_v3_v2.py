@@ -375,6 +375,9 @@ def train(args):
             t0 = time.time()
 
             is_seed = episode < cfg.DREAMER_SEED_EPISODES
+            # --- ADD THIS EPSILON SCHEDULE ---
+            # Starts at 1.0 (pure noise) and decays to 0.1 by episode 1000
+            epsilon = max(0.1, 1.0 - (episode / 1000.0))
 
             done = False
             while not done:
@@ -395,9 +398,19 @@ def train(args):
                     
                     action = np.array([steer, throttle], dtype=np.float32)
                 else:
+                    # Get base action from Dreamer
                     action = dreamer.select_action(
                         obs_tensor, action_tensor, explore=True
                     )
+                    
+                    # --- ADD THIS EXPLORATION INJECTION ---
+                    # Add decaying Gaussian noise to the steering to force corner exploration
+                    noise = np.random.normal(0, epsilon * 0.5) 
+                    action[0] = np.clip(action[0] + noise, -1.0, 1.0)
+                    
+                    # Occasionally force a drastic random turn
+                    if np.random.rand() < (epsilon * 0.1): 
+                         action[0] = np.random.choice([-1.0, 1.0])
 
                 next_obs, reward, terminated, truncated, info = env.step(action)
                 done = terminated or truncated
