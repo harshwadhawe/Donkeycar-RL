@@ -549,12 +549,12 @@ def train(args):
                     prev_sign = s_sign
                 max_same_dir_run = max(max_same_dir_run, cur_same_dir_run)
 
+                # Track displacement from real pos
+                cur_pos = info.get("pos", (0, 0, 0))
+
                 # Sample positions for return-to-start detection
                 if episode_steps % 10 == 0 and cur_pos is not None:
                     positions.append(cur_pos)
-
-                # Track displacement from real pos
-                cur_pos = info.get("pos", (0, 0, 0))
                 if start_pos is None:
                     start_pos = cur_pos
                 dx = cur_pos[0] - start_pos[0]
