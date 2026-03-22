@@ -877,9 +877,9 @@ def evaluate(args):
                 episode_reward += reward
                 episode_steps += 1
 
-                # Count laps
+                # Count laps (skip step 1 — sim carries over last_lap_time from previous episode)
                 lap_time = info.get("last_lap_time", None)
-                if lap_time is not None:
+                if lap_time is not None and episode_steps > 1:
                     lap_time = float(lap_time)
                     if last_lap_time is None or abs(lap_time - last_lap_time) > 0.1:
                         real_laps += 1
