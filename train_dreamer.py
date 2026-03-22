@@ -806,6 +806,105 @@ def train(args):
     logger.info(f'Training complete. Best reward: {best_reward:.1f}')
 
 
+def evaluate(args):
+    """Run trained model in inference mode — no training, no exploration noise."""
+    dk_cfg = dk.load_config(myconfig=args.myconfig)
+    device = get_device()
+    logger.info(f'Device: {device}')
+
+    track = args.track or getattr(dk_cfg, 'DONKEY_GYM_ENV_NAME', 'donkey-generated-track-v0')
+    sim_path = getattr(dk_cfg, 'DONKEY_SIM_PATH', 'manual')
+
+    conf = {
+        "exe_path": sim_path,
+        "host": getattr(dk_cfg, 'SIM_HOST', '127.0.0.1'),
+        "port": 9091,
+        "frame_skip": 2,
+        "cam_resolution": (
+            getattr(dk_cfg, 'IMAGE_H', 120),
+            getattr(dk_cfg, 'IMAGE_W', 160),
+            getattr(dk_cfg, 'IMAGE_DEPTH', 3),
+        ),
+        "log_level": 20,
+        "throttle_max": 1.0,
+        "max_cte": 3.0,
+        "start_delay": 5.0,
+    }
+
+    logger.info(f'Track: {track}')
+    logger.info(f'Sim: {sim_path}')
+
+    env = make_env(track, conf)
+
+    # Load model
+    dreamer = Dreamer(device=device)
+    model_path = args.model
+    if not os.path.exists(model_path):
+        logger.error(f'Model not found: {model_path}')
+        return
+    dreamer.load(model_path)
+    logger.info(f'Loaded model from {model_path}')
+
+    logger.info("=" * 60)
+    logger.info("DREAMER v3 EVALUATION (inference only)")
+    logger.info(f"  Episodes: {args.episodes}")
+    logger.info(f"  Model: {model_path}")
+    logger.info("=" * 60)
+
+    try:
+        for episode in range(args.episodes):
+            obs, info = env.reset()
+            dreamer.reset_belief()
+            last_action = np.zeros(2, dtype=np.float32)
+
+            episode_reward = 0.0
+            episode_steps = 0
+            real_laps = 0
+            last_lap_time = None
+
+            done = False
+            while not done:
+                obs_tensor = torch.from_numpy(obs).unsqueeze(0)
+                action_tensor = torch.from_numpy(last_action).unsqueeze(0)
+
+                action = dreamer.select_action(
+                    obs_tensor, action_tensor, explore=False
+                )
+
+                next_obs, reward, terminated, truncated, info = env.step(action)
+                done = terminated or truncated
+
+                episode_reward += reward
+                episode_steps += 1
+
+                # Count laps
+                lap_time = info.get("last_lap_time", None)
+                if lap_time is not None:
+                    lap_time = float(lap_time)
+                    if last_lap_time is None or abs(lap_time - last_lap_time) > 0.1:
+                        real_laps += 1
+                        logger.info(
+                            f'  LAP {lap_time:.1f}s '
+                            f'(cte={abs(float(info.get("cte", 0))):.2f}, '
+                            f'fwd={float(info.get("forward_vel", 0)):.2f}) '
+                            f'ep {episode} step {episode_steps}')
+                        last_lap_time = lap_time
+
+                obs = next_obs
+                last_action = np.array(action, dtype=np.float32)
+
+            avg_reward = episode_reward / max(episode_steps, 1)
+            logger.info(
+                f'Episode {episode}: steps={episode_steps}, '
+                f'reward={episode_reward:.1f} (avg={avg_reward:.2f}/step), '
+                f'laps={real_laps}')
+
+    except KeyboardInterrupt:
+        logger.info('Stopped by user')
+    finally:
+        env.close()
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Dreamer v3 training')
     parser.add_argument('--episodes', type=int, default=500,
@@ -816,6 +915,11 @@ if __name__ == '__main__':
                         help='Gym env name (default: from myconfig.py)')
     parser.add_argument('--resume', action='store_true',
                         help='Resume from existing model')
+    parser.add_argument('--eval', action='store_true',
+                        help='Run inference only (no training)')
     parser.add_argument('--myconfig', type=str, default='myconfig.py')
     args = parser.parse_args()
-    train(args)
+    if args.eval:
+        evaluate(args)
+    else:
+        train(args)
