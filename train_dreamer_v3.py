@@ -195,8 +195,8 @@ class RewardShapingWrapper(gym.Wrapper):
     Rewards forward velocity and penalizes cross-track error.
     """
 
-    CIRCLE_CHECK_INTERVAL = 50   
-    CIRCLE_MIN_DISPLACEMENT = 3.0  
+    CIRCLE_CHECK_INTERVAL = 25   
+    CIRCLE_MIN_DISPLACEMENT = 1.5  
     CIRCLE_MAX_CTE = 2.0        
     CURRICULUM_CTE_PHASE = 80     
     CURRICULUM_BLEND_PHASE = 120  
@@ -275,10 +275,9 @@ class RewardShapingWrapper(gym.Wrapper):
                 dx = cur_pos[0] - self._window_pos[0]
                 dz = cur_pos[2] - self._window_pos[2]
                 window_disp = (dx**2 + dz**2) ** 0.5
-                window_avg_cte = np.mean(self._window_ctes) if self._window_ctes else 0.0
 
-                if (window_disp < self.CIRCLE_MIN_DISPLACEMENT and
-                        window_avg_cte > self.CIRCLE_MAX_CTE):
+                # Kill if it's not displacing (doing donuts), regardless of CTE
+                if window_disp < self.CIRCLE_MIN_DISPLACEMENT:
                     terminated = True
                     info["circle_terminated"] = True
 
