@@ -448,7 +448,6 @@ class Dreamer:
             # We must disable CUDAGraphs to prevent memory overwriting errors.
             self.rssm = torch.compile(
                 self.rssm, 
-                mode="default", 
                 options={"disable_cudagraphs": True}
             )
             
@@ -456,7 +455,6 @@ class Dreamer:
             # with aggressive CUDAGraphs. Disable them here too.
             self.actor = torch.compile(
                 self.actor, 
-                mode="default", 
                 options={"disable_cudagraphs": True}
             )
         # Optimizers
