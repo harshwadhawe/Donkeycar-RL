@@ -23,6 +23,9 @@ from . import config as cfg
 
 logger = logging.getLogger(__name__)
 
+# Allow PyTorch to use Tensor Cores for float32 matrix multiplications
+if torch.cuda.is_available():
+    torch.set_float32_matmul_precision('high')
 # ─── Constants ───────────────────────────────────────────
 
 NUM_BINS = 255
@@ -429,17 +432,33 @@ class Dreamer:
         self.value_target.load_state_dict(self.value_model.state_dict())
 
         # --- PYTORCH ACCELERATION ---
+# --- PYTORCH ACCELERATION ---
         if hasattr(torch, 'compile') and 'cuda' in self.device:
-            logger.info("Compiling models with torch.compile for reduced overhead...")
+            logger.info("Compiling models with torch.compile...")
+            
+            # The CNNs are perfect for max optimization
             self.encoder = torch.compile(self.encoder, mode="reduce-overhead")
             self.decoder = torch.compile(self.decoder, mode="reduce-overhead")
-            self.rssm = torch.compile(self.rssm, mode="reduce-overhead")
-            self.actor = torch.compile(self.actor, mode="reduce-overhead")
-            self.value_model = torch.compile(self.value_model, mode="reduce-overhead")
             self.reward_model = torch.compile(self.reward_model, mode="reduce-overhead")
+            self.value_model = torch.compile(self.value_model, mode="reduce-overhead")
             if self.continue_model is not None:
                 self.continue_model = torch.compile(self.continue_model, mode="reduce-overhead")
-
+                
+            # The RSSM contains a recurrent loop and categorical sampling.
+            # We must disable CUDAGraphs to prevent memory overwriting errors.
+            self.rssm = torch.compile(
+                self.rssm, 
+                mode="default", 
+                options={"disable_cudagraphs": True}
+            )
+            
+            # The Actor contains torch.distributions sampling which also struggles
+            # with aggressive CUDAGraphs. Disable them here too.
+            self.actor = torch.compile(
+                self.actor, 
+                mode="default", 
+                options={"disable_cudagraphs": True}
+            )
         # Optimizers
         world_params = self._world_params()
         self.world_optimizer = torch.optim.Adam(
@@ -707,7 +726,7 @@ class Dreamer:
             list(self.rssm.parameters()) +
             list(self.reward_model.parameters())
         )
-        if self.continue_model:
+        if self.continue_model is not None:
             params += list(self.continue_model.parameters())
         return params
 
@@ -722,7 +741,7 @@ class Dreamer:
             'value_target': self.value_target.state_dict(),
             'version': 'dreamer_v3_twohot',
         }
-        if self.continue_model:
+        if self.continue_model is not None:
             state['continue_model'] = self.continue_model.state_dict()
         torch.save(state, path)
 
@@ -735,5 +754,5 @@ class Dreamer:
         self.actor.load_state_dict(checkpoint['actor'])
         self.value_model.load_state_dict(checkpoint['value_model'])
         self.value_target.load_state_dict(checkpoint['value_target'])
-        if self.continue_model and 'continue_model' in checkpoint:
+        if self.continue_model is not None and 'continue_model' in checkpoint:
             self.continue_model.load_state_dict(checkpoint['continue_model'])
