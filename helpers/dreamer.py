@@ -297,7 +297,7 @@ class ContinueModel(nn.Module):
         self.mlp = DreamerMLP(feature_size, 1, hidden_size, num_layers)
 
     def forward(self, features):
-        return torch.sigmoid(self.mlp(features))
+        return self.mlp(features)
 
 
 class ValueModel(nn.Module):
@@ -575,10 +575,10 @@ class Dreamer:
 
                 cont_loss = torch.tensor(0.0, device=self.device)
                 if self.continue_model is not None:
-                    pred_cont = bottle(self.continue_model, [features])
+                    pred_cont_logits = bottle(self.continue_model, [features])
                     cont_target = (1 - dones).unsqueeze(-1)
-                    cont_loss = F.binary_cross_entropy(
-                        pred_cont, cont_target, reduction='mean'
+                    cont_loss = F.binary_cross_entropy_with_logits(  # <--- CHANGED HERE
+                        pred_cont_logits, cont_target, reduction='mean'
                     )
 
                 world_loss = obs_loss + reward_loss + kl_loss + cont_loss
@@ -636,7 +636,8 @@ class Dreamer:
                     imag_values = symexp(twohot_decode(imag_value_logits, bins)).unsqueeze(-1)
 
                     if self.continue_model is not None:
-                        imag_cont = bottle(self.continue_model, [imag_features[:-1]])
+                        imag_cont_logits = bottle(self.continue_model, [imag_features[:-1]])
+                        imag_cont = torch.sigmoid(imag_cont_logits)  # <--- ADDED SIGMOID HERE
                     else:
                         imag_cont = torch.ones_like(imag_rewards)
 
