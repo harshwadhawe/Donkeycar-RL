@@ -222,13 +222,13 @@ class RewardShapingWrapper(gym.Wrapper):
             if self.episode_step % 5 == 0:
                 self.breadcrumbs.append((self.episode_step, x, z))
             
-            # Check for path crossings from 2 to 7 seconds ago (20 to 70 steps)
+            # Look back 4 to 10 seconds ago (40 to 100 steps) to account for slower speeds
             for step_num, bx, bz in self.breadcrumbs:
                 age_steps = self.episode_step - step_num
                 
-                if 20 <= age_steps <= 70:
+                if 40 <= age_steps <= 100:
                     dist = ((x - bx)**2 + (z - bz)**2)**0.5
-                    if dist < 1.5:
+                    if dist < 1.2: # Reduced kill radius slightly
                         terminated = True
                         info["circle_terminated"] = True
                         break
