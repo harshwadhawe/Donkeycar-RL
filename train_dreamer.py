@@ -483,7 +483,7 @@ def train(args):
             episode_steps = 0
             episode_fwd_vels = []
             episode_ctes = []
-            episode_steers = []
+            episode_steers = []  # signed steering values
             start_pos = None
             max_displacement = 0.0
             ep_real_laps = 0
@@ -494,6 +494,11 @@ def train(args):
             lap_window_fwd_vels = []
             lap_window_max_disp = 0.0
             lap_window_start_pos = None
+            # Circling diagnostics
+            max_same_dir_run = 0
+            cur_same_dir_run = 0
+            prev_sign = 0
+            positions = []  # sample positions every 10 steps
             t0 = time.time()
 
             is_seed = episode < cfg.DREAMER_SEED_EPISODES
@@ -522,9 +527,24 @@ def train(args):
 
                 fwd_vel = float(info.get("forward_vel", 0.0))
                 step_cte = float(info.get("cte", 0.0))
+                steer_val = float(np.asarray(action)[0])
                 episode_fwd_vels.append(fwd_vel)
                 episode_ctes.append(step_cte)
-                episode_steers.append(abs(float(np.asarray(action)[0])))
+                episode_steers.append(steer_val)
+
+                # Track consecutive same-direction steering
+                s_sign = np.sign(steer_val)
+                if s_sign != 0 and s_sign == prev_sign:
+                    cur_same_dir_run += 1
+                else:
+                    cur_same_dir_run = 0
+                if s_sign != 0:
+                    prev_sign = s_sign
+                max_same_dir_run = max(max_same_dir_run, cur_same_dir_run)
+
+                # Sample positions for return-to-start detection
+                if episode_steps % 10 == 0 and cur_pos is not None:
+                    positions.append(cur_pos)
 
                 # Track displacement from real pos
                 cur_pos = info.get("pos", (0, 0, 0))
@@ -607,18 +627,41 @@ def train(args):
             avg_reward = episode_reward / max(episode_steps, 1)
             avg_fwd = np.mean(episode_fwd_vels) if episode_fwd_vels else 0.0
             avg_cte = np.mean(np.abs(episode_ctes)) if episode_ctes else 0.0
-            avg_steer = np.mean(episode_steers) if episode_steers else 0.0
+            avg_steer = np.mean(np.abs(episode_steers)) if episode_steers else 0.0
+
+            # Circling diagnostics
+            steers_arr = np.array(episode_steers) if episode_steers else np.zeros(1)
+            left_pct = np.mean(steers_arr < -0.05) * 100  # % steps turning left
+            right_pct = np.mean(steers_arr > 0.05) * 100   # % steps turning right
+            steer_bias = max(left_pct, right_pct)           # dominant direction %
+            mean_steer = np.mean(steers_arr)                # signed mean (0 = balanced)
+            # End-displacement: how far from start at episode end
+            end_disp = 0.0
+            if start_pos and cur_pos:
+                end_disp = ((cur_pos[0]-start_pos[0])**2 +
+                            (cur_pos[2]-start_pos[2])**2)**0.5
+
             lap_str = ''
             if ep_real_laps or ep_fake_laps:
                 lap_str = f', laps={ep_real_laps}real/{ep_fake_laps}fake'
             circle_str = ''
             if info.get("circle_terminated"):
                 circle_str = ' [CIRCLE KILLED]'
+
+            # Detect likely circling: high steer bias + low displacement + no real laps
+            is_circling = (steer_bias > 80 and max_displacement < 5.0
+                           and ep_real_laps == 0 and episode_steps > 30)
+            if is_circling:
+                circle_str += ' [LIKELY CIRCLING]'
+
             logger.info(
                 f'Episode {episode}: steps={episode_steps}, '
                 f'reward={episode_reward:.1f} (avg={avg_reward:.2f}/step), '
                 f'fwd_vel={avg_fwd:.2f}, |steer|={avg_steer:.2f}, '
                 f'|cte|={avg_cte:.2f}, disp={max_displacement:.1f}m, '
+                f'end_disp={end_disp:.1f}m, '
+                f'steer_bias={steer_bias:.0f}%{"L" if mean_steer < 0 else "R"} '
+                f'max_run={max_same_dir_run}, '
                 f'buffer={buffer.total_steps}, '
                 f'{"seed" if is_seed else "policy"}'
                 f'{lap_str}{circle_str}, '
