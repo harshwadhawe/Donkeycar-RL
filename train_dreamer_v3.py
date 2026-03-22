@@ -187,17 +187,19 @@ class CTEEstimatorWrapper(gym.Wrapper):
 
 
 # ==============================================================================
-# Reward Shaping Wrapper
+# Reward Shaping Wrapper (Strict Progression)
 # ==============================================================================
 class RewardShapingWrapper(gym.Wrapper):
     """
     Sparser, objective-driven reward shaping for Dreamer.
-    Rewards forward velocity and penalizes cross-track error.
+    Strictly rewards forward displacement and severely penalizes high steering angles.
     """
 
-    CIRCLE_CHECK_INTERVAL = 25   
-    CIRCLE_MIN_DISPLACEMENT = 1.5  
-    CIRCLE_MAX_CTE = 2.0        
+    # Strict Circling Detection
+    CIRCLE_CHECK_INTERVAL = 20   # Check every 1 second (20 steps at 20Hz)
+    CIRCLE_MIN_DISPLACEMENT = 2.0  # Must move at least 2.0 meters per second
+
+    # Curriculum
     CURRICULUM_CTE_PHASE = 80     
     CURRICULUM_BLEND_PHASE = 120  
 
@@ -210,10 +212,8 @@ class RewardShapingWrapper(gym.Wrapper):
         self._episode_num = 0  
         self._start_pos = None
         self._window_pos = None  
-        self._window_ctes = []   
 
     def set_episode(self, episode_num):
-        """Called by training loop to update curriculum phase."""
         self._episode_num = episode_num
 
     def reset(self, **kwargs):
@@ -221,19 +221,18 @@ class RewardShapingWrapper(gym.Wrapper):
         self.stuck_count = 0
         self._start_pos = None
         self._window_pos = None
-        self._window_ctes = []
         return self.env.reset(**kwargs)
 
     def step(self, action):
         obs, _sim_reward, terminated, truncated, info = self.env.step(action)
         self.episode_step += 1
 
-        forward_vel = float(info.get("forward_vel", 0.0))
         cte = float(info.get("cte", 0.0))
         speed = float(info.get("speed", 0.0))
         cur_pos = info.get("pos", None)
+        steering = float(np.asarray(action)[0]) if hasattr(action, '__len__') else 0.0
 
-        # Curriculum: blend from CTE-only to CTE+speed
+        # Curriculum alpha
         ep = self._episode_num
         if ep < self.CURRICULUM_CTE_PHASE:
             alpha = 0.0
@@ -243,12 +242,18 @@ class RewardShapingWrapper(gym.Wrapper):
         else:
             alpha = 1.0
 
-        # Core Reward: Smooth CTE bell curve + Speed blending
-        cte_reward = 5.0 * np.exp(-(cte / 1.0) ** 2)
-        fwd_vel_reward = (1.0 + alpha) * max(forward_vel, 0.0)
+        # 1. Base Reward: Mild CTE bell curve (so the agent still tries to center itself)
+        reward = 2.0 * np.exp(-(cte / 1.0) ** 2)
+
+        # 2. Progression Reward: Calculate straight-line distance moved this step
+        if cur_pos is not None and self._start_pos is not None:
+             # How far did we move from the start THIS step?
+             current_disp = ((cur_pos[0]-self._start_pos[0])**2 + (cur_pos[2]-self._start_pos[2])**2)**0.5
+             reward += (1.0 + alpha) * current_disp * 0.1 # Reward moving further from start
         
-        # Stripped out micro-penalties allowing the agent to find optimal paths natively
-        reward = cte_reward + fwd_vel_reward
+        # 3. Aggressive Steering Penalty (The Donut Killer)
+        # We heavily penalize sustained high steering angles to force straight driving
+        reward -= (1.0 + alpha) * 5.0 * (steering ** 2)
 
         # Standstill detection
         if speed < 0.1:
@@ -263,26 +268,24 @@ class RewardShapingWrapper(gym.Wrapper):
         if abs(cte) > 2.5:
             terminated = True
 
-        # Circling early termination
+        # Strict Circling Early Termination
         if cur_pos is not None:
             if self._start_pos is None:
                 self._start_pos = cur_pos
             if self._window_pos is None:
                 self._window_pos = cur_pos
-            self._window_ctes.append(abs(cte))
 
             if self.episode_step % self.CIRCLE_CHECK_INTERVAL == 0 and self.episode_step > 0:
                 dx = cur_pos[0] - self._window_pos[0]
                 dz = cur_pos[2] - self._window_pos[2]
                 window_disp = (dx**2 + dz**2) ** 0.5
 
-                # Kill if it's not displacing (doing donuts), regardless of CTE
+                # Kill if it hasn't moved 2 meters straight in the last second
                 if window_disp < self.CIRCLE_MIN_DISPLACEMENT:
                     terminated = True
                     info["circle_terminated"] = True
 
                 self._window_pos = cur_pos
-                self._window_ctes = []
 
         if terminated or truncated:
             reward -= 10.0
@@ -291,8 +294,7 @@ class RewardShapingWrapper(gym.Wrapper):
             truncated = True
 
         return obs, reward, terminated, truncated, info
-
-
+    
 # ==============================================================================
 # Smooth Action Wrapper
 # ==============================================================================
